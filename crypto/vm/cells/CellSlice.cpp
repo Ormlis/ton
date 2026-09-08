@@ -962,14 +962,7 @@ int CellSlice::remove_trailing() {
 }
 
 bool cell_builder_add_slice_bool(CellBuilder& cb, const CellSlice& cs) {
-  if (!cb.can_extend_by(cs.size(), cs.size_refs())) {
-    return false;
-  }
-  for (unsigned cnt = 0; cnt < cs.size_refs(); cnt++) {
-    cb.store_ref(cs.prefetch_ref(cnt));
-  }
-  cb.store_bits(cs.as_bitslice());
-  return true;
+  return cb.append_cellslice_bool(cs);
 }
 
 CellBuilder& cell_builder_add_slice(CellBuilder& cb, const CellSlice& cs) {
