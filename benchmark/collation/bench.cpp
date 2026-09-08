@@ -33,6 +33,7 @@
 #include "td/actor/coro_utils.h"
 #include "td/utils/OptionParser.h"
 #include "td/utils/Timer.h"
+#include "td/utils/filesystem.h"
 #include "td/utils/crypto.h"
 #include "td/utils/logging.h"
 #include "td/utils/misc.h"
@@ -1256,6 +1257,9 @@ td::actor::Task<RunOutput> run_benchmark(Fixture fixture, Config config,
       auto result = co_await collate_once(manager.get(), fixture, config);
       if (!measured_collation_check) {
         measured_collation_check = std::move(result.candidate);
+      } else if (result.candidate.data.as_slice() != measured_collation_check.value().data.as_slice() ||
+                 result.candidate.collated_data.as_slice() != measured_collation_check.value().collated_data.as_slice()) {
+        co_return td::Status::Error("measured collation candidates are not byte-identical");
       }
       Sample sample{.mode = Mode::Collate, .iteration = i, .collate_wall_s = result.wall_s};
       sample.collation = std::move(result.stats);
@@ -1265,6 +1269,19 @@ td::actor::Task<RunOutput> run_benchmark(Fixture fixture, Config config,
     transfer_status = verify_transfer_outcome(measured_collation_check.value(), fixture, config);
     if (transfer_status.is_error()) {
       co_return transfer_status;
+    }
+    // Optional experiment artifacts, written after all timed collation iterations.
+    if (const char* directory = std::getenv("COLLATION_BENCH_CANDIDATE_OUT")) {
+      auto status = td::atomic_write_file(PSTRING() << directory << "/block.boc",
+                                          measured_collation_check.value().data.as_slice());
+      if (status.is_error()) {
+        co_return status;
+      }
+      status = td::atomic_write_file(PSTRING() << directory << "/collated.boc",
+                                     measured_collation_check.value().collated_data.as_slice());
+      if (status.is_error()) {
+        co_return status;
+      }
     }
   }
   if (run_validate_series) {
@@ -1489,6 +1506,21 @@ void print_stage_summary(Mode mode, ValidationVariant variant, td::Slice query,
 }
 
 void print_results(const RunOutput& output, bool verbose) {
+  ton::validator::CollationStats::AccountProofBatch batch;
+  for (const auto& sample : output.samples) {
+    if (sample.collation) {
+      const auto& value = sample.collation.value().account_proof_batch;
+      batch.replacements += value.replacements;
+      batch.checkpoints += value.checkpoints;
+      batch.fallbacks += value.fallbacks;
+      batch.checks += value.checks;
+    }
+  }
+  if (batch.replacements || batch.checkpoints || batch.fallbacks || batch.checks) {
+    std::cout << "COLLATION-VALIDATION-BENCH phase=account-proof-batch replacements=" << batch.replacements
+              << " checkpoints=" << batch.checkpoints << " fallbacks=" << batch.fallbacks
+              << " checks=" << batch.checks << '\n';
+  }
   if (output.bootstrap_from_corpus) {
     std::cout << "COLLATION-VALIDATION-BENCH phase=bootstrap status=ok measured=0 kind=corpus-restored"
               << " wall_ms=0.000000 mc_id=" << output.bootstrapped_mc_id.to_str()

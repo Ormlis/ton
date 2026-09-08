@@ -16,6 +16,11 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
+#include <array>
+#include <memory>
+#include <set>
+#include <vector>
+
 #include "common/bigint.hpp"
 #include "fift/utils.h"
 #include "td/utils/ScopeGuard.h"
@@ -23,6 +28,8 @@
 #include "td/utils/base64.h"
 #include "td/utils/tests.h"
 #include "vm/cp0.h"
+#include "vm/boc.h"
+#include "vm/cells/UsageCell.h"
 #include "vm/dict.h"
 #include "vm/vm.h"
 
@@ -446,4 +453,233 @@ ATEXITALT
 RETALT
 )A";
   test_run_vm(fift::compile_asm(test1).move_as_ok());
+}
+
+namespace {
+
+class DeferredSumAugmentation final : public vm::dict::AugmentationData {
+ public:
+  explicit DeferredSumAugmentation(bool variable = true) : variable_(variable) {
+  }
+  bool fail_fork{false};
+  bool skip_extra(vm::CellSlice& cs) const override {
+    return variable_ ? cs.have(4) && cs.advance(static_cast<unsigned>(cs.fetch_ulong(4)) * 8) : cs.advance(64);
+  }
+  bool eval_leaf(vm::CellBuilder& cb, vm::CellSlice& value) const override {
+    return value.have(32) && store(cb, value.prefetch_ulong(32));
+  }
+  bool eval_fork(vm::CellBuilder& cb, vm::CellSlice& left, vm::CellSlice& right) const override {
+    return !fail_fork && store(cb, read(left) + read(right));
+  }
+  bool eval_empty(vm::CellBuilder& cb) const override {
+    return store(cb, 0);
+  }
+
+ private:
+  bool variable_;
+  bool store(vm::CellBuilder& cb, td::uint64 value) const {
+    if (!variable_) {
+      return cb.store_long_bool(value, 64);
+    }
+    unsigned bytes = 0;
+    for (auto rest = value; rest; rest >>= 8) {
+      ++bytes;
+    }
+    return cb.store_long_bool(bytes, 4) && cb.store_long_bool(value, bytes * 8);
+  }
+  td::uint64 read(vm::CellSlice& cs) const {
+    return cs.fetch_ulong(variable_ ? static_cast<unsigned>(cs.fetch_ulong(4)) * 8 : 64);
+  }
+};
+
+td::Ref<vm::Cell> deferred_value(unsigned balance, unsigned version) {
+  auto payload = vm::CellBuilder{}.store_long(version, 32).finalize_novm();
+  return vm::CellBuilder{}.store_long(balance, 32).store_ref(payload).finalize_novm();
+}
+
+void assert_deferred_roots(vm::AugmentedDictionary& serial, vm::AugmentedDictionary& deferred) {
+  auto left = serial.get_root_cell();
+  auto right = deferred.get_root_cell();
+  ASSERT_EQ(left.is_null(), right.is_null());
+  if (left.not_null()) {
+    ASSERT_EQ(left->get_hash(), right->get_hash());
+    auto a = vm::std_boc_serialize(left).move_as_ok();
+    auto b = vm::std_boc_serialize(right).move_as_ok();
+    ASSERT_EQ(a.as_slice(), b.as_slice());
+  }
+}
+
+}  // namespace
+
+TEST(VM, deferred_replacements_preserve_checkpoint_stats_and_eager_usage) {
+  for (int width : {16, 256}) {
+    for (bool variable : {false, true}) {
+      DeferredSumAugmentation augmentation{variable};
+      vm::AugmentedDictionary original{width, augmentation};
+      std::vector<td::BitArray<256>> keys(96);
+      for (unsigned i = 0; i < keys.size(); ++i) {
+        keys[i].set_zero();
+        keys[i].bits().store_uint(i * 601, 16);
+        ASSERT_TRUE(original.set(keys[i].bits(), width, vm::load_cell_slice(deferred_value(i, i))));
+      }
+      auto serial_usage = std::make_shared<vm::CellUsageTree>();
+      auto deferred_usage = std::make_shared<vm::CellUsageTree>();
+      std::set<vm::CellHash> serial_loaded, deferred_loaded;
+      serial_usage->set_cell_load_callback([&](const vm::LoadedCell& cell) {
+        serial_loaded.insert(cell.data_cell->get_hash());
+      });
+      deferred_usage->set_cell_load_callback([&](const vm::LoadedCell& cell) {
+        deferred_loaded.insert(cell.data_cell->get_hash());
+      });
+      vm::AugmentedDictionary serial{vm::UsageCell::create(original.get_root_cell(), serial_usage->root_ptr()),
+                                     width, augmentation, false};
+      vm::AugmentedDictionary deferred{vm::UsageCell::create(original.get_root_cell(), deferred_usage->root_ptr()),
+                                       width, augmentation, false};
+      vm::AugmentedDictionary::DeferredReplacements batch{deferred};
+      vm::NewCellStorageStat serial_proof, deferred_proof;
+      for (unsigned operation = 0; operation < 195; ++operation) {
+        // Empty checkpoints, repeated keys, repeated values, shuffled full-width paths,
+        // shrinking/growing augmentations, and an incomplete last batch.
+        if (operation / 16 != 3 && operation / 16 != 8) {
+          unsigned index = operation * 37 % keys.size();
+          auto value = vm::load_cell_slice(deferred_value(operation % 5 == 0 ? 0 : 255 + operation, operation % 17));
+          serial_proof.add_proof(value.prefetch_ref(), serial_usage.get());
+          deferred_proof.add_proof(value.prefetch_ref(), deferred_usage.get());
+          ASSERT_TRUE(serial.set(keys[index].bits(), width, value));
+          ASSERT_TRUE(batch.replace(keys[index].bits(), width, value));
+          // Match usage after each transaction, not just at the proof checkpoint.
+          ASSERT_TRUE(serial_loaded == deferred_loaded);
+        }
+        if ((operation + 1) % 16 == 0) {
+          batch.flush();
+          assert_deferred_roots(serial, deferred);
+          serial_proof.add_proof(serial.get_root_cell(), serial_usage.get());
+          deferred_proof.add_proof(deferred.get_root_cell(), deferred_usage.get());
+          ASSERT_TRUE(serial_proof.get_proof_stat() == deferred_proof.get_proof_stat());
+          ASSERT_TRUE(serial_loaded == deferred_loaded);
+        }
+      }
+      batch.flush();
+      assert_deferred_roots(serial, deferred);
+    }
+  }
+}
+
+TEST(VM, deferred_replacements_fix_leaf_and_parent_byte_boundaries) {
+  DeferredSumAugmentation augmentation;
+  for (bool leaf_boundary : {false, true}) {
+    vm::AugmentedDictionary serial{16, augmentation};
+    td::BitArray<16> a, b{-1};
+    a.set_zero();
+    ASSERT_TRUE(serial.set(a, vm::load_cell_slice(deferred_value(leaf_boundary ? 255 : 100, 1))));
+    ASSERT_TRUE(serial.set(b, vm::load_cell_slice(deferred_value(leaf_boundary ? 0 : 155, 2))));
+    vm::AugmentedDictionary deferred{serial};
+    auto old_bits = vm::load_cell_slice(serial.get_root_cell()).size();
+    vm::AugmentedDictionary::DeferredReplacements batch{deferred};
+    auto value = vm::load_cell_slice(deferred_value(leaf_boundary ? 256 : 101, 3));
+    ASSERT_TRUE(serial.set(a, value));
+    ASSERT_TRUE(batch.replace(a.bits(), 16, value));
+    batch.flush();
+    assert_deferred_roots(serial, deferred);
+    ASSERT_EQ(vm::load_cell_slice(deferred.get_root_cell()).size(), old_bits + 8);
+  }
+}
+
+TEST(VM, deferred_replacements_preserve_hash_deduplication) {
+  DeferredSumAugmentation augmentation;
+  vm::AugmentedDictionary serial{16, augmentation};
+  td::BitArray<16> key{1};
+  auto a = vm::load_cell_slice(deferred_value(1, 1));
+  auto b = vm::load_cell_slice(deferred_value(2, 2));
+  ASSERT_TRUE(serial.set(key, a));
+  vm::AugmentedDictionary deferred{serial};
+  vm::AugmentedDictionary::DeferredReplacements batch{deferred};
+  auto usage = std::make_shared<vm::CellUsageTree>();
+  vm::NewCellStorageStat serial_proof, deferred_proof;
+  for (unsigned step = 0; step < 6; ++step) {
+    const auto& value = step % 3 == 1 ? b : a;
+    ASSERT_TRUE(serial.set(key, value));
+    ASSERT_TRUE(batch.replace(key.bits(), 16, value));
+    batch.flush();
+    assert_deferred_roots(serial, deferred);
+    auto before = deferred_proof.get_proof_stat();
+    serial_proof.add_proof(serial.get_root_cell(), usage.get());
+    deferred_proof.add_proof(deferred.get_root_cell(), usage.get());
+    ASSERT_TRUE(serial_proof.get_proof_stat() == deferred_proof.get_proof_stat());
+    if (step >= 2) {
+      ASSERT_EQ(deferred_proof.get_proof_stat().cells, before.cells);
+      ASSERT_EQ(deferred_proof.get_proof_stat().internal_refs, before.internal_refs + 1);
+    }
+  }
+}
+
+TEST(VM, deferred_replacements_flush_before_topology_fallback) {
+  DeferredSumAugmentation augmentation;
+  for (unsigned fallback_at : {0u, 15u, 16u, 19u, 31u}) {
+    vm::AugmentedDictionary serial{16, augmentation};
+    std::array<td::BitArray<16>, 3> keys{td::BitArray<16>{1}, td::BitArray<16>{2}, td::BitArray<16>{3}};
+    for (unsigned i = 0; i < 2; ++i) {
+      ASSERT_TRUE(serial.set(keys[i], vm::load_cell_slice(deferred_value(i + 1, i))));
+    }
+    auto usage = std::make_shared<vm::CellUsageTree>();
+    vm::AugmentedDictionary deferred{serial};
+    auto batch = std::make_unique<vm::AugmentedDictionary::DeferredReplacements>(deferred);
+    vm::NewCellStorageStat serial_proof, deferred_proof;
+    for (unsigned operation = 0; operation < 48; ++operation) {
+      auto value = vm::load_cell_slice(deferred_value(operation + 255, operation));
+      if (operation == fallback_at) {
+        ASSERT_TRUE(!batch->replace(keys[2].bits(), 16, value));
+        batch->flush();
+        batch.reset();
+        ASSERT_TRUE(serial.set(keys[2], value));
+        ASSERT_TRUE(deferred.set(keys[2], value));
+      } else if (operation == fallback_at + 1) {
+        ASSERT_TRUE(serial.lookup_delete(keys[2]).not_null());
+        ASSERT_TRUE(deferred.lookup_delete(keys[2]).not_null());
+      } else {
+        auto& key = keys[operation % 2];
+        ASSERT_TRUE(serial.set(key, value));
+        ASSERT_TRUE(batch ? batch->replace(key.bits(), 16, value) : deferred.set(key, value));
+      }
+      if ((operation + 1) % 16 == 0) {
+        if (batch) {
+          batch->flush();
+        }
+        assert_deferred_roots(serial, deferred);
+        serial_proof.add_proof(serial.get_root_cell(), usage.get());
+        deferred_proof.add_proof(deferred.get_root_cell(), usage.get());
+        ASSERT_TRUE(serial_proof.get_proof_stat() == deferred_proof.get_proof_stat());
+      }
+    }
+  }
+}
+
+TEST(VM, deferred_replacements_failures_do_not_publish_partial_root) {
+  DeferredSumAugmentation augmentation;
+  vm::AugmentedDictionary dictionary{16, augmentation};
+  td::BitArray<16> a{1}, b{2}, missing{3};
+  auto value = vm::load_cell_slice(deferred_value(255, 1));
+  {
+    vm::AugmentedDictionary::DeferredReplacements empty{dictionary};
+    ASSERT_TRUE(!empty.replace(a.bits(), 16, value));
+    empty.flush();
+    ASSERT_TRUE(dictionary.is_empty());
+  }
+  ASSERT_TRUE(dictionary.set(a, value));
+  ASSERT_TRUE(dictionary.set(b, value));
+  auto root = dictionary.get_root_cell();
+  vm::AugmentedDictionary::DeferredReplacements batch{dictionary};
+  ASSERT_TRUE(!batch.replace(a.bits(), 15, value));
+  ASSERT_TRUE(!batch.replace(missing.bits(), 16, value));
+  ASSERT_TRUE(batch.replace(a.bits(), 16, vm::load_cell_slice(deferred_value(256, 2))));
+  ASSERT_TRUE(dictionary.get_root_cell().get() == root.get());
+  augmentation.fail_fork = true;
+  bool threw = false;
+  try {
+    batch.flush();
+  } catch (const vm::VmError&) {
+    threw = true;
+  }
+  ASSERT_TRUE(threw);
+  ASSERT_TRUE(dictionary.get_root_cell().get() == root.get());
 }

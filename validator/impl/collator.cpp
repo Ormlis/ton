@@ -18,6 +18,7 @@
 */
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
 #include <ctime>
 
 #include "adnl/utils.hpp"
@@ -55,6 +56,22 @@ static constexpr td::uint32 SKIP_EXTERNALS_QUEUE_SIZE = 8000;
 static constexpr int HIGH_PRIORITY_EXTERNAL = 10;  // don't skip high priority externals when queue is big
 
 static constexpr int MAX_ATTEMPTS = 5;
+
+static bool account_dict_batch_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("TON_SIM_ACCOUNT_DICT_BATCH");
+    return value == nullptr || td::Slice{value} != "0";
+  }();
+  return enabled;
+}
+
+static bool account_dict_batch_check_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("TON_SIM_ACCOUNT_DICT_BATCH_CHECK");
+    return value != nullptr && td::Slice{value} == "1";
+  }();
+  return enabled;
+}
 
 /**
  * Constructs a Collator object.
@@ -1326,6 +1343,16 @@ bool Collator::import_shard_state_data(block::ShardState& ss) {
   prev_vert_seqno_ = ss.vert_seqno_;
   total_balance_ = old_total_balance_ = std::move(ss.total_balance_);
   value_flow_.from_prev_blk = old_total_balance_;
+  // Extra-currency augmentation may itself traverse dictionaries. Keep its original
+  // timing, and split/merge/masterchain paths, on the sequential implementation.
+  if (account_dict_batch_enabled() && !is_masterchain() && !after_split_ && !after_merge_ &&
+      old_total_balance_.extra.is_null()) {
+    account_dict_estimator_batch_ =
+        std::make_unique<vm::AugmentedDictionary::DeferredReplacements>(*account_dict_estimator_);
+    if (account_dict_batch_check_enabled()) {
+      account_dict_estimator_reference_ = std::make_unique<vm::AugmentedDictionary>(*account_dict_estimator_);
+    }
+  }
   total_validator_fees_ = std::move(ss.total_validator_fees_);
   old_global_balance_ = std::move(ss.global_balance_);
   out_msg_queue_ = std::move(ss.out_msg_queue_);
@@ -5771,21 +5798,63 @@ bool Collator::update_account_dict_estimation(const block::transaction::Transact
   const block::Account& acc = trans.account;
   if (acc.orig_total_state->get_hash() != acc.total_state->get_hash() &&
       account_dict_estimator_added_accounts_.insert(acc.addr).second) {
+    if (account_dict_estimator_batch_ &&
+        (acc.orig_status == block::Account::acc_nonexist || acc.status == block::Account::acc_nonexist ||
+         acc.balance.extra.not_null())) {
+      // Commit the pending replacements before applying a topology/extra-currency change.
+      // No extra add_proof here: keep exactly the original checkpoint schedule and history.
+      account_dict_estimator_batch_->flush();
+      account_dict_estimator_batch_.reset();
+      ++stats_.account_proof_batch.fallbacks;
+    }
     // see combine_account_transactions
     if (acc.status == block::Account::acc_nonexist) {
       account_dict_estimator_->lookup_delete(acc.addr);
+      if (account_dict_estimator_reference_) {
+        account_dict_estimator_reference_->lookup_delete(acc.addr);
+      }
     } else {
       vm::CellBuilder cb;
       if (!(cb.store_ref_bool(acc.total_state)             // account_descr$_ account:^Account
             && cb.store_bits_bool(acc.last_trans_hash_)    // last_trans_hash:bits256
-            && cb.store_long_bool(acc.last_trans_lt_, 64)  // last_trans_lt:uint64
-            && account_dict_estimator_->set_builder(acc.addr, cb))) {
+            && cb.store_long_bool(acc.last_trans_lt_, 64))) {  // last_trans_lt:uint64
+        return false;
+      }
+      auto value = vm::load_cell_slice(cb.finalize_copy());
+      if (account_dict_estimator_reference_ && !account_dict_estimator_reference_->set(acc.addr, value)) {
+        return false;
+      }
+      if (account_dict_estimator_batch_) {
+        if (account_dict_estimator_batch_->replace(acc.addr.bits(), 256, value)) {
+          ++stats_.account_proof_batch.replacements;
+        } else {
+          account_dict_estimator_batch_->flush();
+          account_dict_estimator_batch_.reset();
+          ++stats_.account_proof_batch.fallbacks;
+          if (!account_dict_estimator_->set(acc.addr, value)) {
+            return false;
+          }
+        }
+      } else if (!account_dict_estimator_->set(acc.addr, value)) {
         return false;
       }
     }
   }
   ++account_dict_ops_;
   if (!(account_dict_ops_ & 15)) {
+    if (account_dict_estimator_batch_) {
+      account_dict_estimator_batch_->flush();
+      ++stats_.account_proof_batch.checkpoints;
+    }
+    if (account_dict_estimator_reference_) {
+      auto reference = account_dict_estimator_reference_->get_root_cell();
+      auto actual = account_dict_estimator_->get_root_cell();
+      if (reference.is_null() != actual.is_null() ||
+          (reference.not_null() && reference->get_hash() != actual->get_hash())) {
+        return fatal_error("deferred account dictionary differs from sequential checkpoint");
+      }
+      ++stats_.account_proof_batch.checks;
+    }
     return block_limit_status_->add_proof(account_dict_estimator_->get_root_cell());
   }
   return true;

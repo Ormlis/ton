@@ -3130,6 +3130,116 @@ bool AugmentedDictionary::set_builder(td::ConstBitPtr key, int key_len, const Ce
   return set(key, key_len, load_cell_slice(value.finalize_copy()), mode);
 }
 
+bool AugmentedDictionary::DeferredReplacements::replace(td::ConstBitPtr key, int key_len, const CellSlice& value) {
+  dictionary_.force_validate();
+  if (key_len != dictionary_.get_key_bits() || dictionary_.is_empty()) {
+    return false;
+  }
+  if (nodes_.empty()) {
+    nodes_.emplace_back(dictionary_.get_root_cell(), key_len);
+  }
+  return replace(nodes_.front(), key, value);
+}
+
+bool AugmentedDictionary::DeferredReplacements::replace(Node& node, td::ConstBitPtr key, const CellSlice& value) {
+  if (!node.label.is_prefix_of(key, node.remaining_bits)) {
+    return false;  // Insertion: the caller can flush successful replacements and use ordinary set().
+  }
+  int suffix_bits = node.remaining_bits - node.label.l_bits;
+  if (!suffix_bits) {
+    CellBuilder cb;
+    append_dict_label(cb, key, node.remaining_bits, node.remaining_bits);
+    node.cell = dictionary_.finish_create_leaf(cb, value);
+    node.extra.clear();
+    node.dirty = true;
+    return true;
+  }
+  unsigned branch = key[node.label.l_bits];
+  if (node.children[branch] < 0) {
+    int index = static_cast<int>(nodes_.size());
+    nodes_.emplace_back(node.label.remainder->prefetch_ref(branch), suffix_bits - 1);
+    node.children[branch] = index;
+  }
+  if (!replace(nodes_[node.children[branch]], key + node.label.l_bits + 1, value)) {
+    return false;
+  }
+  unsigned sibling = branch ^ 1;
+  if (node.children[sibling] < 0 && node.original_extras[sibling].is_null()) {
+    // Serial set reads this sibling's augmentation while rebuilding the parent. Preserve
+    // that read now: on_cell_loaded contributes to collated-data limits between checkpoints.
+    node.original_extras[sibling] =
+        dictionary_.get_node_extra(node.label.remainder->prefetch_ref(sibling), suffix_bits - 1);
+    if (node.original_extras[sibling].is_null()) {
+      throw VmError{Excno::dict_err, "cannot extract deferred replacement sibling extra"};
+    }
+  }
+  node.dirty = true;
+  return true;
+}
+
+Ref<CellSlice> AugmentedDictionary::DeferredReplacements::child_extra(Node& node, unsigned branch) {
+  Ref<CellSlice>* extra;
+  if (node.children[branch] >= 0) {
+    auto& child = nodes_[node.children[branch]];
+    extra = &child.extra;
+    if (extra->is_null()) {
+      *extra = dictionary_.get_node_extra(child.cell, child.remaining_bits);
+    }
+  } else {
+    extra = &node.original_extras[branch];
+    if (extra->is_null()) {
+      *extra = dictionary_.get_node_extra(node.label.remainder->prefetch_ref(branch),
+                                          node.remaining_bits - node.label.l_bits - 1);
+    }
+  }
+  if (extra->is_null()) {
+    throw VmError{Excno::dict_err, "cannot extract deferred replacement child extra"};
+  }
+  return *extra;
+}
+
+Ref<Cell> AugmentedDictionary::DeferredReplacements::materialize(Node& node) {
+  if (!node.dirty) {
+    return node.cell;
+  }
+  int suffix_bits = node.remaining_bits - node.label.l_bits;
+  if (suffix_bits) {
+    auto child = [&](unsigned branch) {
+      return node.children[branch] < 0 ? node.label.remainder->prefetch_ref(branch)
+                                       : materialize(nodes_[node.children[branch]]);
+    };
+    auto left = child(0);
+    auto right = child(1);
+    CellBuilder cb;
+    if (node.label.l_same) {
+      append_dict_label_same(cb, node.label.l_same & 1, node.label.l_bits, node.remaining_bits);
+    } else {
+      append_dict_label(cb, node.label.bits(), node.label.l_bits, node.remaining_bits);
+    }
+    // Same encoding as finish_create_fork, using already available extras. Stack copies
+    // let eval_fork consume them without allocating two additional CellSlice objects.
+    CellSlice left_extra{*child_extra(node, 0)};
+    CellSlice right_extra{*child_extra(node, 1)};
+    cb.store_ref(std::move(left)).store_ref(std::move(right));
+    unsigned extra_offset = cb.size();
+    if (!dictionary_.aug.eval_fork(cb, left_extra, right_extra)) {
+      throw VmError{Excno::dict_err, "cannot compute deferred replacement fork extra"};
+    }
+    node.cell = cb.finalize();
+    node.extra = load_cell_slice_ref(node.cell);
+    node.extra.write().advance(extra_offset);
+    node.extra.write().advance_refs(2);
+  }
+  node.dirty = false;
+  return node.cell;
+}
+
+void AugmentedDictionary::DeferredReplacements::flush() {
+  if (!nodes_.empty() && nodes_.front().dirty) {
+    dictionary_.set_root_cell(materialize(nodes_.front()));
+  }
+}
+
 bool AugmentedDictionary::check_for_each_extra(const foreach_extra_func_t& foreach_extra_func, bool invert_first) {
   force_validate();
   const auto& augm = aug;

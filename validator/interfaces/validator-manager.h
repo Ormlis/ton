@@ -82,6 +82,10 @@ struct StorageStatCacheStats {
 };
 
 struct CollationStats {
+  struct AccountProofBatch {
+    td::uint64 replacements{0}, checkpoints{0}, fallbacks{0}, checks{0};
+  } account_proof_batch;
+
   struct ExternalMessages {
     td::uint32 total;
     td::uint32 filtered;

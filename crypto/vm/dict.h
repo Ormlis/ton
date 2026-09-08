@@ -17,6 +17,7 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
+#include <deque>
 #include <functional>
 
 #include "common/bitstring.h"
@@ -562,6 +563,7 @@ class AugmentedDictionary final : public DictionaryFixed {
   const AugmentationData& aug;
 
  public:
+  class DeferredReplacements;
   typedef std::function<bool(Ref<CellSlice>, Ref<CellSlice>, td::ConstBitPtr, int)> foreach_extra_func_t;
   // return value of traverse_func: < 0 = error, 0 = skip, 1 = visit only left, 2 = visit only right, 5 = visit right, then left, 6 = visit left, then right
   // for leaf nodes, all >0 values mean accept and return node as the final result, 0 = skip (continue scanning)
@@ -653,6 +655,40 @@ class AugmentedDictionary final : public DictionaryFixed {
   }
   std::pair<Ref<CellSlice>, Ref<CellSlice>> dict_traverse_extra(Ref<Cell> dict, td::BitPtr key_buffer, int n,
                                                                 const traverse_func_t& traverse_node) const;
+};
+
+// Collect replacements of existing keys and materialize shared ancestors once at flush().
+// Leaves are built immediately. Original paths and sibling extras are read during replace(),
+// so usage-tree reads are not postponed until flush. The augmentation must not load additional
+// original cells in eval_fork (ShardAccounts without extra currencies satisfies this).
+// Do not otherwise mutate the dictionary while this object is alive. No VM gas accounting:
+// this helper is intended for the collator, not dictionary instructions executed by the VM.
+class AugmentedDictionary::DeferredReplacements {
+ public:
+  explicit DeferredReplacements(AugmentedDictionary& dictionary) : dictionary_(dictionary) {
+  }
+  bool replace(td::ConstBitPtr key, int key_len, const CellSlice& value);
+  void flush();
+
+ private:
+  struct Node {
+    Ref<Cell> cell;
+    dict::LabelParser label;
+    int remaining_bits;
+    std::array<int, 2> children{{-1, -1}};
+    std::array<Ref<CellSlice>, 2> original_extras;
+    Ref<CellSlice> extra;
+    bool dirty{false};
+    Node(Ref<Cell> cell, int remaining_bits)
+        : cell(cell), label(std::move(cell), remaining_bits, dict::LabelParser::chk_size),
+          remaining_bits(remaining_bits) {
+    }
+  };
+  AugmentedDictionary& dictionary_;
+  std::deque<Node> nodes_;  // References remain valid when another path is appended.
+  bool replace(Node& node, td::ConstBitPtr key, const CellSlice& value);
+  Ref<Cell> materialize(Node& node);
+  Ref<CellSlice> child_extra(Node& node, unsigned branch);
 };
 
 }  // namespace vm
