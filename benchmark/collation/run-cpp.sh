@@ -7,8 +7,8 @@ build_dir=$source_root/cmake-build-bench
 
 binary=${COLLATION_BENCH_BINARY:-}
 corpus=${COLLATION_BENCH_CORPUS:-}
-iterations=${COLLATION_BENCH_ITERATIONS:-15}
-warmup=${COLLATION_BENCH_WARMUP:-1}
+iterations=${COLLATION_BENCH_ITERATIONS:-30}
+warmup=${COLLATION_BENCH_WARMUP:-3}
 threads=${COLLATION_BENCH_THREADS:-1}
 accounts=${COLLATION_BENCH_ACCOUNTS:-1000000}
 transfers=${COLLATION_BENCH_TRANSFERS:-128}
@@ -28,8 +28,8 @@ processes and prints one summary line per series.
 Options (all optional):
   --corpus DIR           corpus directory (default: cmake-build-bench/collation-corpus-<accounts>x<transfers>; generated if missing)
   --binary PATH          benchmark executable (default: built in cmake-build-bench)
-  --iterations N         measured repetitions per process (default 15)
-  --warmup N             unmeasured repetitions per process (default 1)
+  --iterations N         measured repetitions per process (default 30)
+  --warmup N             unmeasured repetitions per process (default 3)
   --threads N            actor scheduler threads (default 1)
   --accounts N           corpus accounts when generating (default 1000000)
   --transfers N          corpus transfers when generating (default 128)
