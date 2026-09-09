@@ -33,6 +33,15 @@ namespace td {
 
 class Ed25519 {
  public:
+  struct VerificationCacheStats {
+    uint64 hits{0};
+    uint64 misses{0};
+    uint64 bypasses{0};
+    uint64 inserts{0};
+    uint64 evictions{0};
+    uint64 write_contentions{0};
+  };
+
   class PublicKey {
    public:
     static constexpr size_t LENGTH = 32;
@@ -113,6 +122,15 @@ class Ed25519 {
   static Result<SecureString> compute_shared_secret(const PublicKey &public_key, const PrivateKey &private_key);
 
   static Result<SecureString> get_public_key(Slice private_key);
+
+  // The process-global verification cache stores only successful checks and
+  // compares the complete (public key, data, signature) tuple on every hit.
+  // Data longer than the maximum TVM CHKSIGNS input is never cached.
+  // Statistics are diagnostic: snapshots and resets are thread-safe but not
+  // linearizable with verification calls running concurrently.
+  static VerificationCacheStats get_verification_cache_stats();
+  static void clear_verification_cache();
+  static void reset_verification_cache_stats();
 
   static int version();
 };

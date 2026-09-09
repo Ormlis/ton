@@ -17,7 +17,9 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 
 #include "crypto/Ed25519.h"
 #include "keys/keys.hpp"
@@ -212,6 +214,143 @@ TEST(Crypto, almost_zero) {
       LOG(ERROR) << "FAILED: " << j;
       break;
     }
+  }
+}
+
+TEST(Crypto, signature_cache_full_key_and_lengths) {
+  auto secret = td::Ed25519::generate_private_key().move_as_ok();
+  auto key = secret.get_public_key().move_as_ok();
+  std::string message(32, 'a');
+  auto signature = secret.sign(message).move_as_ok();
+  for (int i = 0; i < 3; ++i) {
+    key.verify_signature(message, signature).ensure();
+  }
+  auto changed = message;
+  changed[31] ^= 1;
+  ASSERT_TRUE(key.verify_signature(changed, signature).is_error());
+  auto bad_signature = signature.copy();
+  bad_signature.as_mutable_slice()[63] ^= 1;
+  ASSERT_TRUE(key.verify_signature(message, bad_signature).is_error());
+  auto other_key = td::Ed25519::generate_private_key().move_as_ok().get_public_key().move_as_ok();
+  ASSERT_TRUE(other_key.verify_signature(message, signature).is_error());
+  ASSERT_TRUE(key.verify_signature(message, signature.as_slice().substr(0, 63)).is_error());
+  ASSERT_TRUE(key.verify_signature(message, signature.as_slice().str() + "x").is_error());
+  auto public_bytes = key.as_octet_string();
+  td::Ed25519::PublicKey short_key{td::SecureString{public_bytes.as_slice().substr(0, 31)}};
+  ASSERT_TRUE(short_key.verify_signature(message, signature).is_error());
+  key.verify_signature(message, signature).ensure();
+
+  // Exercise both cacheable lengths and the bypass above 128 bytes.
+  for (size_t length : {0u, 1u, 31u, 33u, 128u, 129u, 1024u}) {
+    std::string data(length, 'b');
+    auto sig = secret.sign(data).move_as_ok();
+    key.verify_signature(data, sig).ensure();
+    key.verify_signature(data, sig).ensure();
+    data.push_back('c');
+    ASSERT_TRUE(key.verify_signature(data, sig).is_error());
+  }
+}
+
+TEST(Crypto, signature_cache_lengths_stats_and_clear) {
+  auto secret = td::Ed25519::generate_private_key().move_as_ok();
+  auto key = secret.get_public_key().move_as_ok();
+  for (size_t length : {0u, 1u, 31u, 32u, 33u, 128u, 129u, 1024u}) {
+    td::Ed25519::clear_verification_cache();
+    std::string data(length, 'x');
+    auto signature = secret.sign(data).move_as_ok();
+    key.verify_signature(data, signature).ensure();
+    key.verify_signature(data, signature).ensure();
+    auto stats = td::Ed25519::get_verification_cache_stats();
+    if (length <= 128) {
+      ASSERT_EQ(stats.misses, 1u);
+      ASSERT_EQ(stats.inserts, 1u);
+      ASSERT_EQ(stats.hits, 1u);
+      ASSERT_EQ(stats.bypasses, 0u);
+    } else {
+      ASSERT_EQ(stats.bypasses, 2u);
+      ASSERT_EQ(stats.inserts, 0u);
+      ASSERT_EQ(stats.hits, 0u);
+    }
+  }
+
+  td::Ed25519::clear_verification_cache();
+  std::string data(32, 'z');
+  auto signature = secret.sign(data).move_as_ok();
+  key.verify_signature(data, signature).ensure();
+  td::Ed25519::reset_verification_cache_stats();
+  key.verify_signature(data, signature).ensure();
+  ASSERT_EQ(td::Ed25519::get_verification_cache_stats().hits, 1u);
+  ASSERT_EQ(td::Ed25519::get_verification_cache_stats().inserts, 0u);
+  auto invalid = signature.copy();
+  invalid.as_mutable_slice()[0] ^= 1;
+  ASSERT_TRUE(key.verify_signature(data, invalid).is_error());
+  ASSERT_TRUE(key.verify_signature(data, invalid).is_error());
+  ASSERT_EQ(td::Ed25519::get_verification_cache_stats().misses, 2u);
+  ASSERT_EQ(td::Ed25519::get_verification_cache_stats().inserts, 0u);
+
+  td::Ed25519::clear_verification_cache();
+  key.verify_signature(data, signature).ensure();
+  ASSERT_EQ(td::Ed25519::get_verification_cache_stats().misses, 1u);
+  ASSERT_EQ(td::Ed25519::get_verification_cache_stats().hits, 0u);
+}
+
+TEST(Crypto, signature_cache_concurrent_hits_misses_and_eviction) {
+  td::Ed25519::clear_verification_cache();
+  auto secret = td::Ed25519::generate_private_key().move_as_ok();
+  auto key = secret.get_public_key().move_as_ok();
+  std::vector<std::pair<std::string, std::string>> samples;
+  // More valid tuples than cache slots, followed by repeated verification from eight threads.
+  for (unsigned i = 0; i < 65537; ++i) {
+    std::string data(32, 'm');
+    data[0] = static_cast<char>(i);
+    data[1] = static_cast<char>(i >> 8);
+    data[2] = static_cast<char>(i >> 16);
+    auto sig = secret.sign(data).move_as_ok();
+    samples.emplace_back(std::move(data), sig.as_slice().str());
+  }
+  std::vector<std::thread> threads;
+  for (unsigned worker = 0; worker < 8; ++worker) {
+    threads.emplace_back([&, worker] {
+      for (unsigned i = worker; i < samples.size(); i += 8) {
+        const auto& sample = samples[i];
+        key.verify_signature(sample.first, sample.second).ensure();
+        key.verify_signature(sample.first, sample.second).ensure();
+        auto invalid = sample.second;
+        invalid[0] ^= 1;
+        ASSERT_TRUE(key.verify_signature(sample.first, invalid).is_error());
+      }
+      for (unsigned i = 0; i < 128; ++i) {
+        key.verify_signature(samples[i].first, samples[i].second).ensure();
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  ASSERT_TRUE(td::Ed25519::get_verification_cache_stats().evictions > 0);
+}
+
+TEST(Crypto, signature_cache_concurrent_clear) {
+  auto secret = td::Ed25519::generate_private_key().move_as_ok();
+  auto key = secret.get_public_key().move_as_ok();
+  std::string data(128, 'r');
+  auto signature = secret.sign(data).move_as_ok();
+  auto invalid = signature.copy();
+  invalid.as_mutable_slice()[0] ^= 1;
+  std::vector<std::thread> threads;
+  for (unsigned worker = 0; worker < 8; ++worker) {
+    threads.emplace_back([&] {
+      for (unsigned i = 0; i < 1000; ++i) {
+        key.verify_signature(data, signature).ensure();
+        ASSERT_TRUE(key.verify_signature(data, invalid).is_error());
+      }
+    });
+  }
+  for (unsigned i = 0; i < 1000; ++i) {
+    td::Ed25519::clear_verification_cache();
+  }
+  for (auto& thread : threads) {
+    thread.join();
   }
 }
 
