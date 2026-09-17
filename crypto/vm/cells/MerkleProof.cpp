@@ -92,9 +92,10 @@ class MerkleProofImpl {
     for (unsigned i = 0; i < cs.size_refs(); i++) {
       cb.store_ref(dfs(cs.prefetch_ref(i), children_merkle_depth));
     }
-    auto hash_hint = [&](unsigned level, const Cell::LevelMask &, CellHash &hash) {
-      if (level <= merkle_depth) {
-        hash = cell->get_hash(level);
+    auto hash_hint = [&](unsigned level, const Cell::LevelMask &mask, CellHash &hash) {
+      auto normalized_level = mask.apply(level).get_level();
+      if (normalized_level <= merkle_depth) {
+        hash = cell->get_hash(normalized_level);
         return true;
       }
       return false;
