@@ -187,12 +187,21 @@ int BagOfCells::add_root(td::Ref<vm::Cell> add_root) {
 
 // Changes in this function may require corresponding changes in crypto/vm/large-boc-serializer.cpp
 td::Status BagOfCells::import_cells() {
+  return import_cells_impl<true>();
+}
+
+td::Status BagOfCells::import_cells_untracked() {
+  return import_cells_impl<false>();
+}
+
+template <bool TrackUsage>
+td::Status BagOfCells::import_cells_impl() {
   if (logger_ptr_) {
     logger_ptr_->start_stage("import_cells");
   }
   cells_clear();
   for (auto& root : roots) {
-    auto res = import_cell(root.cell, 0);
+    auto res = import_cell<TrackUsage>(root.cell, 0);
     if (res.is_error()) {
       return res.move_as_error();
     }
@@ -210,6 +219,7 @@ td::Status BagOfCells::import_cells() {
 }
 
 // Changes in this function may require corresponding changes in crypto/vm/large-boc-serializer.cpp
+template <bool TrackUsage>
 td::Result<int> BagOfCells::import_cell(td::Ref<vm::Cell> cell, int depth) {
   if (depth > max_depth) {
     return td::Status::Error("error while importing a cell into a bag of cells: cell depth too large");
@@ -230,7 +240,7 @@ td::Result<int> BagOfCells::import_cell(td::Ref<vm::Cell> cell, int depth) {
     return td::Status::Error(
         "error while importing a cell into a bag of cells: cell has non-zero virtualization level");
   }
-  auto r_loaded_dc = cell->load_cell();
+  auto r_loaded_dc = TrackUsage ? cell->load_cell() : cell->load_cell_untracked();
   if (r_loaded_dc.is_error()) {
     return td::Status::Error("error while importing a cell into a bag of cells: " +
                              r_loaded_dc.move_as_error().to_string());
@@ -241,7 +251,7 @@ td::Result<int> BagOfCells::import_cell(td::Ref<vm::Cell> cell, int depth) {
   DCHECK(cs.size_refs() <= 4);
   unsigned sum_child_wt = 1;
   for (unsigned i = 0; i < cs.size_refs(); i++) {
-    auto ref = import_cell(cs.prefetch_ref(i), depth + 1);
+    auto ref = import_cell<TrackUsage>(cs.prefetch_ref(i), depth + 1);
     if (ref.is_error()) {
       return ref.move_as_error();
     }

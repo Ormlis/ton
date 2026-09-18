@@ -348,6 +348,10 @@ class BagOfCells {
   int add_roots(const std::vector<td::Ref<vm::Cell>>& add_roots);
   int add_root(td::Ref<vm::Cell> add_root);
   td::Status import_cells() TD_WARN_UNUSED_RESULT;
+  // Import without recording usage, including through nested UsageCells.
+  // May load lazy cells: only run concurrently with thread-safe payload readers,
+  // after all proof decisions that depend on physical residency are complete.
+  td::Status import_cells_untracked() TD_WARN_UNUSED_RESULT;
   BagOfCells() = default;
   void set_logger(BagOfCellsLogger* logger_ptr) {
     logger_ptr_ = logger_ptr;
@@ -379,6 +383,9 @@ class BagOfCells {
 
  private:
   int rv_idx;
+  template <bool TrackUsage>
+  td::Status import_cells_impl();
+  template <bool TrackUsage>
   td::Result<int> import_cell(td::Ref<vm::Cell> cell, int depth);
   void cells_clear() {
     cell_count = 0;

@@ -45,6 +45,11 @@ class VirtualCell : public Cell {
     loaded_cell.effective_level = std::min(loaded_cell.effective_level, effective_level_);
     return std::move(loaded_cell);
   }
+  td::Result<LoadedCell> load_cell_untracked() const override {
+    TRY_RESULT(loaded_cell, cell_->load_cell_untracked());
+    loaded_cell.effective_level = std::min(loaded_cell.effective_level, effective_level_);
+    return std::move(loaded_cell);
+  }
 
   Ref<Cell> virtualize(td::uint32 new_effective_level) const override {
     if (effective_level_ <= new_effective_level) {

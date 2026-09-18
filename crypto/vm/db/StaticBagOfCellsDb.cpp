@@ -42,6 +42,9 @@ class RootCell : public Cell {
   td::Result<LoadedCell> load_cell() const override {
     return cell_->load_cell();
   }
+  td::Result<LoadedCell> load_cell_untracked() const override {
+    return cell_->load_cell_untracked();
+  }
   Ref<Cell> virtualize(td::uint32 effective_level) const override {
     return cell_->virtualize(effective_level);
   }

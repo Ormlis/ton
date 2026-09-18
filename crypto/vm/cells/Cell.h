@@ -55,6 +55,12 @@ class Cell : public CellTraits {
   // load interface
   virtual td::Status set_data_cell(Ref<DataCell>&& data_cell) const = 0;
   virtual td::Result<LoadedCell> load_cell() const = 0;
+  // Load payload without recording proof usage. Wrappers must forward this
+  // operation without invoking callbacks or returning a usage tree node.
+  // Lazy loading is allowed; the caller must ensure loader thread safety.
+  virtual td::Result<LoadedCell> load_cell_untracked() const {
+    return load_cell();
+  }
   virtual Ref<Cell> virtualize(td::uint32 effective_level) const;
   // Cell is virtualized if its effective level is less than its actual level.
   virtual bool is_virtualized() const = 0;

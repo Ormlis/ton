@@ -48,6 +48,9 @@ class UsageCell : public Cell {
     }
     return std::move(loaded_cell);
   }
+  td::Result<LoadedCell> load_cell_untracked() const override {
+    return cell_->load_cell_untracked();
+  }
   Ref<Cell> virtualize(td::uint32 effective_level) const override {
     auto virtualized_cell = cell_->virtualize(effective_level);
     if (tree_node_.empty()) {

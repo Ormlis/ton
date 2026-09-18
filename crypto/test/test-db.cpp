@@ -63,6 +63,7 @@
 #include "vm/boc.h"
 #include "vm/cells.h"
 #include "vm/cells/CellString.h"
+#include "vm/cells/ExtCell.h"
 #include "vm/cells/MerkleProof.h"
 #include "vm/cells/MerkleUpdate.h"
 #include "vm/db/CellStorage.h"
@@ -3080,6 +3081,168 @@ TEST(TonDb, StackOverflow) {
       head = std::move(new_head);
     }
   }
+}
+
+TEST(TonDb, BocUntracked) {
+  td::Random::Xorshift128plus rnd(123);
+  auto tree = std::make_shared<vm::CellUsageTree>();
+  auto inner_tree = std::make_shared<vm::CellUsageTree>();
+  int loads = 0;
+  tree->set_cell_load_callback([&](const vm::LoadedCell &) { ++loads; });
+  inner_tree->set_cell_load_callback([&](const vm::LoadedCell &) { ++loads; });
+  auto raw_child = vm::gen_random_cell(100, rnd, true);
+  auto child = vm::UsageCell::create(raw_child, inner_tree->root_ptr());
+  auto root = vm::UsageCell::create(vm::CellBuilder().store_ref(child).store_ref(child).finalize(), tree->root_ptr());
+  vm::BagOfCells boc;
+  boc.set_roots({root, child});
+  boc.import_cells_untracked().ensure();
+  ASSERT_EQ(loads, 0);
+  ASSERT_TRUE(!tree->is_loaded(tree->root_id()));
+  ASSERT_EQ(tree->get_child(tree->root_id(), 0), 0u);
+  ASSERT_TRUE(!inner_tree->is_loaded(inner_tree->root_id()));
+  std::vector<td::BufferSlice> expected;
+  for (int mode : {0, 2, 31}) {
+    expected.push_back(boc.serialize_to_slice(mode).move_as_ok());
+  }
+  // The tracked API deliberately rejects overlapping trees. Compare bytes on
+  // an equivalent graph with a single active tree along each path.
+  auto expected_root = vm::CellBuilder().store_ref(raw_child).store_ref(raw_child).finalize();
+  boc.set_roots({vm::UsageCell::create(expected_root, tree->root_ptr()), child});
+  boc.import_cells().ensure();
+  ASSERT_TRUE(loads > 0);
+  int i = 0;
+  for (int mode : {0, 2, 31}) {
+    ASSERT_EQ(boc.serialize_to_slice(mode).move_as_ok().as_slice(), expected[i++].as_slice());
+  }
+}
+
+TEST(TonDb, BocUntrackedConcurrentLazy) {
+  struct State {
+    td::Ref<vm::DataCell> data;
+    std::barrier<> loaders{2};
+    std::atomic<int> calls{0};
+  };
+  struct Loader {
+    static td::Result<td::Ref<vm::DataCell>> load_data_cell(const vm::Cell &, const std::shared_ptr<State> &state) {
+      ++state->calls;
+      // Force both serializers to enter the loader before payload publication.
+      state->loaders.arrive_and_wait();
+      return state->data;
+    }
+  };
+  auto state = std::make_shared<State>();
+  auto leaf = vm::CellBuilder().store_long(42, 32).finalize();
+  state->data = leaf->load_cell().move_as_ok().data_cell;
+  auto hash = leaf->get_hash();
+  auto lazy = vm::ExtCell<std::shared_ptr<State>, Loader>::create(
+                  {leaf->get_level_mask(), hash.as_slice(), td::Slice("\0\0", 2)}, std::shared_ptr<State>(state))
+                  .move_as_ok();
+  auto raw_root = vm::CellBuilder().store_ref(lazy).store_ref(lazy).finalize();
+  auto proof = vm::MerkleProof::generate(raw_root, [&](const auto &c) { return c->get_hash() == hash; }).move_as_ok();
+  auto proof_hash = proof->get_hash();
+  ASSERT_TRUE(!lazy->is_loaded());
+  auto tree = std::make_shared<vm::CellUsageTree>();
+  tree->set_cell_load_callback([](const vm::LoadedCell &) { ASSERT_TRUE(false); });
+  auto root = vm::UsageCell::create(raw_root, tree->root_ptr());
+  auto expected_root = vm::CellBuilder().store_ref(leaf).store_ref(leaf).finalize();
+  std::array<td::BufferSlice, 2> expected, actual;
+  for (int i = 0; i < 2; ++i) {
+    vm::BagOfCells boc;
+    boc.set_roots({expected_root, proof});
+    boc.import_cells().ensure();
+    expected[i] = boc.serialize_to_slice(i ? 2 : 31).move_as_ok();
+  }
+  std::vector<std::thread> workers;
+  for (int i = 0; i < 2; ++i) {
+    workers.emplace_back([&, i] {
+      vm::BagOfCells boc;
+      boc.set_roots({root, proof});
+      boc.import_cells_untracked().ensure();
+      actual[i] = boc.serialize_to_slice(i ? 2 : 31).move_as_ok();
+    });
+  }
+  for (auto &worker : workers) {
+    worker.join();
+  }
+  ASSERT_EQ(state->calls.load(), 2);
+  ASSERT_TRUE(lazy->is_loaded());
+  ASSERT_TRUE(!tree->is_loaded(tree->root_id()));
+  ASSERT_EQ(tree->get_child(tree->root_id(), 0), 0u);
+  ASSERT_EQ(proof->get_hash(), proof_hash);
+  for (int i = 0; i < 2; ++i) {
+    ASSERT_EQ(actual[i].as_slice(), expected[i].as_slice());
+  }
+}
+
+TEST(TonDb, BocUntrackedConcurrentFile) {
+  td::Random::Xorshift128plus rnd(123);
+  auto cell = vm::gen_random_cell(1000, rnd, false);
+  auto expected = vm::std_boc_serialize(cell, 31).move_as_ok();
+  auto file = td::mkstemp(td::get_temporary_dir()).move_as_ok();
+  const auto &path = file.second;
+  file.first.close();
+  td::write_file(path, expected.as_slice()).ensure();
+  SCOPE_EXIT {
+    td::unlink(path).ensure();
+  };
+  auto blob = td::FileBlobView::create(path).move_as_ok();
+  auto db = vm::StaticBagOfCellsDbLazy::create(std::move(blob)).move_as_ok();
+  // Publish only after header/root initialization; retain db through the join.
+  auto root = db->get_root_cell(0).move_as_ok();
+  auto tree = std::make_shared<vm::CellUsageTree>();
+  tree->set_cell_load_callback([](const vm::LoadedCell &) { ASSERT_TRUE(false); });
+  auto tracked = vm::UsageCell::create(root, tree->root_ptr());
+  std::barrier start(2);
+  auto serialize = [&] {
+    start.arrive_and_wait();
+    vm::BagOfCells boc;
+    boc.set_root(tracked);
+    boc.import_cells_untracked().ensure();
+    ASSERT_EQ(boc.serialize_to_slice(31).move_as_ok().as_slice(), expected.as_slice());
+  };
+  std::thread worker(serialize);
+  serialize();
+  worker.join();
+  ASSERT_TRUE(!tree->is_loaded(tree->root_id()));
+  ASSERT_EQ(tree->get_child(tree->root_id(), 0), 0u);
+}
+
+TEST(TonDb, BocUntrackedLoadError) {
+  struct Loader {
+    static td::Result<td::Ref<vm::DataCell>> load_data_cell(const vm::Cell &, const std::shared_ptr<int> &calls) {
+      ++*calls;
+      return td::Status::Error("test loader failure");
+    }
+  };
+  auto leaf = vm::CellBuilder().store_long(42, 32).finalize();
+  auto hash = leaf->get_hash();
+  auto calls = std::make_shared<int>(0);
+  auto lazy = vm::ExtCell<std::shared_ptr<int>, Loader>::create(
+                  {leaf->get_level_mask(), hash.as_slice(), td::Slice("\0\0", 2)}, std::shared_ptr<int>(calls))
+                  .move_as_ok();
+  auto tree = std::make_shared<vm::CellUsageTree>();
+  vm::BagOfCells boc;
+  boc.set_root(vm::UsageCell::create(lazy, tree->root_ptr()));
+  auto status = boc.import_cells_untracked();
+  ASSERT_TRUE(status.is_error());
+  ASSERT_TRUE(status.message().str().find("test loader failure") != std::string::npos);
+  ASSERT_EQ(*calls, 1);
+  ASSERT_TRUE(!tree->is_loaded(tree->root_id()));
+}
+
+TEST(TonDb, BocUntrackedVirtualCell) {
+  auto tree = std::make_shared<vm::CellUsageTree>();
+  auto leaf = vm::CellBuilder().store_long(42, 32).finalize();
+  auto branch = vm::CellBuilder::create_pruned_branch(vm::CellBuilder().store_ref(leaf).finalize(), 1);
+  auto virtualized = vm::VirtualCell::create(0, vm::UsageCell::create(branch, tree->root_ptr()));
+  auto loaded = virtualized->load_cell_untracked().move_as_ok();
+  ASSERT_EQ(loaded.effective_level, 0u);
+  ASSERT_TRUE(loaded.tree_node.empty());
+  ASSERT_TRUE(!tree->is_loaded(tree->root_id()));
+  auto tracked = virtualized->load_cell().move_as_ok();
+  ASSERT_EQ(tracked.effective_level, loaded.effective_level);
+  ASSERT_TRUE(!tracked.tree_node.empty());
+  ASSERT_TRUE(tree->is_loaded(tree->root_id()));
 }
 
 TEST(TonDb, BocRespectsUsageCell) {

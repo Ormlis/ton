@@ -2508,7 +2508,7 @@ td::actor::Task<> Collator::do_collate_inner() {
     // F. create a block candidate
     LOG(DEBUG) << "create a Block candidate";
     td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.create_block_candidate};
-    if (!create_block_candidate()) {
+    if (!co_await create_block_candidate()) {
       co_return td::Status::Error("cannot serialize a new Block candidate");
     }
   }
@@ -6419,6 +6419,29 @@ bool Collator::create_collated_data() {
   return true;
 }
 
+namespace {
+
+struct SerializedBoc {
+  td::BufferSlice data;
+  td::Bits256 file_hash;
+  double cpu_time;
+};
+
+td::Result<SerializedBoc> serialize_candidate_boc(std::vector<Ref<vm::Cell>> roots, int mode) {
+  td::ThreadCpuTimer timer;
+  td::BufferSlice data;
+  if (!roots.empty()) {
+    vm::BagOfCells boc;
+    boc.set_roots(roots);
+    TRY_STATUS(boc.import_cells_untracked());
+    TRY_RESULT_ASSIGN(data, boc.serialize_to_slice(mode));
+  }
+  auto hash = block::compute_file_hash(data.as_slice());
+  return SerializedBoc{std::move(data), hash, timer.elapsed()};
+}
+
+}  // namespace
+
 /**
  * Creates a block candidate for the Collator.
  *
@@ -6431,40 +6454,47 @@ bool Collator::create_collated_data() {
  *
  * @returns True if the block candidate was created successfully, false otherwise.
  */
-bool Collator::create_block_candidate() {
+td::actor::Task<bool> Collator::create_block_candidate() {
   auto consensus_config = config_->get_new_consensus_config(workchain());
-  // 1. serialize block
-  LOG(INFO) << "serializing new Block";
-  vm::BagOfCells boc;
-  boc.set_root(new_block);
-  auto res = boc.import_cells();
-  if (res.is_error()) {
-    return fatal_error(res.move_as_error());
+  // All proofs are complete. Both serializers may load lazy payloads, but must
+  // never write usage. Keep the actor (and its source BOCs) alive until the
+  // worker finishes, including when the actor times out while awaiting it.
+  auto task = [](Ref<vm::Cell> root, td::actor::ActorRef<> keep_alive) -> td::actor::Task<SerializedBoc> {
+    co_return serialize_candidate_boc({std::move(root)}, 31);
+  }(new_block, td::actor::ActorRef<>::try_from(actor_id(this)));
+  task.set_executor(td::actor::Executor::on_scheduler());
+  auto block_task = std::move(task).start();
+  auto collated_result = serialize_candidate_boc(collated_roots_, 2);
+  td::Result<SerializedBoc> block_result;
+  td::Timer wait_timer;
+  {
+    // Coroutine resumption may switch threads; pause both thread CPU timers.
+    td::ScopedRealCpuTimer::Guard pause_total{work_timer_total_, nullptr};
+    td::ScopedRealCpuTimer::Guard pause_phase{work_timer_, nullptr};
+    block_result = co_await std::move(block_task).wrap();
   }
-  auto blk_res = boc.serialize_to_slice(31);
-  if (blk_res.is_error()) {
-    LOG(ERROR) << "cannot serialize block";
-    return fatal_error(blk_res.move_as_error());
+  auto wait_time = wait_timer.elapsed();
+  stats_.work_time.total.real += wait_time;
+  stats_.work_time.create_block_candidate.real += wait_time;
+  if (block_result.is_ok()) {
+    stats_.work_time.total.cpu += block_result.ok().cpu_time;
+    stats_.work_time.create_block_candidate.cpu += block_result.ok().cpu_time;
   }
-  auto blk_slice = blk_res.move_as_ok();
-  // 2. serialize collated data
-  td::BufferSlice cdata_slice;
-  if (collated_roots_.empty()) {
-    cdata_slice = td::BufferSlice{0};
-  } else {
-    vm::BagOfCells boc_collated;
-    boc_collated.set_roots(collated_roots_);
-    res = boc_collated.import_cells();
-    if (res.is_error()) {
-      return fatal_error(res.move_as_error());
-    }
-    auto cdata_res = boc_collated.serialize_to_slice(2);
-    if (cdata_res.is_error()) {
-      LOG(ERROR) << "cannot serialize collated data";
-      return fatal_error(cdata_res.move_as_error());
-    }
-    cdata_slice = cdata_res.move_as_ok();
+  if (!busy_) {
+    co_return false;
   }
+  // Join even on collated-data failure, retaining the original error priority.
+  // Errors are propagated directly; there is no sequential retry of either BOC.
+  if (block_result.is_error()) {
+    co_return fatal_error(block_result.move_as_error());
+  }
+  if (collated_result.is_error()) {
+    co_return fatal_error(collated_result.move_as_error());
+  }
+  auto serialized_block = block_result.move_as_ok();
+  auto serialized_collated = collated_result.move_as_ok();
+  auto blk_slice = std::move(serialized_block.data);
+  auto cdata_slice = std::move(serialized_collated.data);
   LOG(INFO) << "serialized block size " << blk_slice.size() << " bytes (preliminary estimate was "
             << block_size_estimate_ << ")";
   auto st = block_limit_status_->st_stat.get_total_stat();
@@ -6473,11 +6503,10 @@ bool Collator::create_block_candidate() {
             << block_limit_status_->transactions;
   LOG(INFO) << "serialized collated data size " << cdata_slice.size() << " bytes (preliminary estimate was "
             << block_limit_status_->collated_data_size_estimate << ")";
-  auto new_block_id_ext = ton::BlockIdExt{ton::BlockId{shard_, new_block_seqno}, new_block->get_hash().bits(),
-                                          block::compute_file_hash(blk_slice.as_slice())};
+  auto new_block_id_ext =
+      ton::BlockIdExt{ton::BlockId{shard_, new_block_seqno}, new_block->get_hash().bits(), serialized_block.file_hash};
   // 3. create a BlockCandidate
-  block_candidate = std::make_unique<BlockCandidate>(params_.creator, new_block_id_ext,
-                                                     block::compute_file_hash(cdata_slice.as_slice()),
+  block_candidate = std::make_unique<BlockCandidate>(params_.creator, new_block_id_ext, serialized_collated.file_hash,
                                                      blk_slice.clone(), cdata_slice.clone());
   bool need_out_msg_queue_broadcasts = false;  // Not supported yet
   if (need_out_msg_queue_broadcasts) {
@@ -6517,15 +6546,15 @@ bool Collator::create_block_candidate() {
 
   // 3.1 check block and collated data size
   if (block_candidate->data.size() > consensus_config.max_block_size) {
-    return fatal_error(PSTRING() << "block size (" << block_candidate->data.size()
-                                 << ") exceeds the limit in consensus config (" << consensus_config.max_block_size
-                                 << ")");
+    co_return fatal_error(PSTRING() << "block size (" << block_candidate->data.size()
+                                    << ") exceeds the limit in consensus config (" << consensus_config.max_block_size
+                                    << ")");
   }
   if (block_candidate->collated_data.size() > consensus_config.max_collated_data_size &&
       !params_.collator_opts->ignore_collated_data_limits) {
-    return fatal_error(PSTRING() << "collated data size (" << block_candidate->collated_data.size()
-                                 << ") exceeds the limit in consensus config ("
-                                 << consensus_config.max_collated_data_size << ")");
+    co_return fatal_error(PSTRING() << "collated data size (" << block_candidate->collated_data.size()
+                                    << ") exceeds the limit in consensus config ("
+                                    << consensus_config.max_collated_data_size << ")");
   }
   // 4. finish collation
   td::actor::send_closure_later(actor_id(this), &Collator::return_block_candidate);
@@ -6539,7 +6568,7 @@ bool Collator::create_block_candidate() {
     td::actor::send_closure(manager, &ValidatorManager::update_storage_stat_cache,
                             std::move(storage_stat_cache_update_));
   }
-  return true;
+  co_return true;
 }
 
 /**

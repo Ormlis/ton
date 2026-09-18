@@ -163,18 +163,13 @@ class FileBlobViewImpl : public BlobViewImpl {
       res_offset += len;
     }
     CHECK(slice.size() == res_offset);
-    total_view_size_ += slice.size();
     return slice;
-  }
-  ~FileBlobViewImpl() {
-    //LOG(ERROR) << "LOADED " << pages_.size() << " " << total_view_size_;
   }
 
  private:
   td::FileFd fd_;
   td::uint64 file_size_;
   const td::uint64 page_size = 4096;
-  td::uint64 total_view_size_{0};
 
   td::RwMutex pages_rw_mutex_;
   td::HashMap<td::uint64, td::BufferSlice> pages_;
