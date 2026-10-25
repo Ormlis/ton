@@ -1520,17 +1520,9 @@ bool ValidateQuery::compute_prev_state() {
  */
 bool ValidateQuery::compute_next_state() {
   LOG(DEBUG) << "computing next state";
-  auto res = vm::MerkleUpdate::validate(state_update_);
-  if (res.is_error()) {
-    return reject_query("state update is invalid: "s + res.move_as_error().to_string());
-  }
-  res = vm::MerkleUpdate::may_apply(prev_state_root_, state_update_);
-  if (res.is_error()) {
-    return reject_query("state update cannot be applied: "s + res.move_as_error().to_string());
-  }
-  auto r_state_root = vm::MerkleUpdate::apply(prev_state_root_, state_update_);
+  auto r_state_root = vm::MerkleUpdate::validate_and_apply(prev_state_root_, state_update_);
   if (r_state_root.is_error()) {
-    return reject_query("cannot apply Merkle update from block to compute new state");
+    return reject_query("state update is invalid or cannot be applied: "s + r_state_root.move_as_error().to_string());
   }
   state_root_ = r_state_root.move_as_ok();
   Bits256 state_hash{state_root_->get_hash().bits()};

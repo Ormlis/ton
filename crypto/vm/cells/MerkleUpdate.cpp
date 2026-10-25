@@ -184,6 +184,107 @@ class MerkleUpdateValidator {
     return td::Status::OK();
   }
 };
+
+class MerkleUpdateValidateApply {
+ public:
+  td::Result<Ref<Cell>> apply(Ref<Cell> from, Ref<Cell> update_from, Ref<Cell> update_to, td::uint32 from_level,
+                              td::uint32 to_level, StoreCellHint *hint = nullptr) {
+    if (from_level != from->get_level()) {
+      return td::Status::Error("level mismatch");
+    }
+    hint_ = hint;
+    if (hint_ != nullptr) {
+      *hint_ = StoreCellHint{};
+    }
+    TRY_STATUS(dfs_both(from, update_from, from_level));
+    return dfs(update_to, to_level);
+  }
+
+ private:
+  using Key = std::pair<Cell::Hash, unsigned>;
+  struct KnownCell {
+    Ref<Cell> cell;
+    unsigned merkle_depth;
+  };
+  td::HashMap<Cell::Hash, KnownCell> known_cells_;
+  td::HashMap<Key, Ref<Cell>> ready_cells_;
+  td::HashSet<Key> visited_from_;
+  StoreCellHint *hint_ = nullptr;
+
+  td::Status dfs_both(Ref<Cell> original, Ref<Cell> update_from, int merkle_depth) {
+    if (!visited_from_.emplace(update_from->get_hash(), merkle_depth).second) {
+      return td::Status::OK();
+    }
+    TRY_STATUS(compare_cells(original, merkle_depth, update_from, merkle_depth));
+    CellSlice cs_update_from(NoVm(), update_from);
+    // The original matches the proof at this depth, so it can also stand in
+    // for the proof when checking repeated hashes and right-hand branches.
+    auto [it, added] = known_cells_.emplace(original->get_hash(merkle_depth),
+                                          KnownCell{original, (unsigned)merkle_depth});
+    if (!added) {
+      TRY_STATUS(compare_cells(update_from, merkle_depth, it->second.cell, it->second.merkle_depth));
+    }
+    if (cs_update_from.special_type() == Cell::SpecialType::PrunnedBranch) {
+      return td::Status::OK();
+    }
+    int child_merkle_depth = cs_update_from.child_merkle_depth(merkle_depth);
+
+    CellSlice cs_original(NoVm(), original);
+    if (cs_original.size_refs() != cs_update_from.size_refs()) {
+      return td::Status::Error("cell ref count mismatch");
+    }
+    for (unsigned i = 0; i < cs_original.size_refs(); i++) {
+      TRY_STATUS(dfs_both(cs_original.prefetch_ref(i), cs_update_from.prefetch_ref(i), child_merkle_depth));
+    }
+    return td::Status::OK();
+  }
+
+  td::Result<Ref<Cell>> dfs(Ref<Cell> cell, unsigned merkle_depth) {
+    CellSlice cs(NoVm(), cell);
+    if (cs.special_type() == Cell::SpecialType::PrunnedBranch) {
+      if (cell->get_level() == merkle_depth + 1) {
+        CellHash hash = cell->get_hash(merkle_depth);
+        auto it = known_cells_.find(hash);
+        if (it != known_cells_.end()) {
+          auto &known = it->second;
+          TRY_STATUS(compare_cells(known.cell, known.merkle_depth, cell, merkle_depth));
+          if (known.merkle_depth != known.cell->get_level()) {
+            TRY_STATUS(compare_cells(known.cell, known.cell->get_level(), cell, merkle_depth));
+          }
+          if (hint_ != nullptr) {
+            hint_->prev_state_cells.insert(hash);
+          }
+          return known.cell;
+        }
+        return td::Status::Error(PSTRING() << "unknown prunned branch " << hash.to_hex());
+      }
+      return cell;
+    }
+    Key key{cell->get_hash(), merkle_depth};
+    {
+      auto it = ready_cells_.find(key);
+      if (it != ready_cells_.end()) {
+        return it->second;
+      }
+    }
+
+    int child_merkle_depth = cs.child_merkle_depth(merkle_depth);
+
+    CellBuilder cb;
+    cb.store_bits(cs.fetch_bits(cs.size()));
+    for (unsigned i = 0; i < cs.size_refs(); i++) {
+      TRY_RESULT(ref, dfs(cs.prefetch_ref(i), child_merkle_depth));
+      cb.store_ref(std::move(ref));
+    }
+    auto hash_hint = [&](unsigned level, const Cell::LevelMask &, CellHash &hash) {
+      hash = cell->get_hash(std::min(level, merkle_depth));
+      return true;
+    };
+    auto res = cb.finalize(cs.is_special(), std::move(hash_hint));
+    ready_cells_.emplace(key, res);
+    return res;
+  }
+};
 }  // namespace detail
 
 td::Status MerkleUpdate::may_apply(Ref<Cell> from, Ref<Cell> update) {
@@ -212,6 +313,20 @@ td::Result<Ref<Cell>> MerkleUpdate::apply(Ref<Cell> from, Ref<Cell> update, Stor
   auto update_from = cs.fetch_ref();
   auto update_to = cs.fetch_ref();
   return apply_raw(std::move(from), std::move(update_from), std::move(update_to), 0, 0, hint);
+}
+
+td::Result<Ref<Cell>> MerkleUpdate::validate_and_apply(Ref<Cell> from, Ref<Cell> update, StoreCellHint *hint) {
+  if (update->get_level() != 0 || from->get_level() != 0) {
+    return td::Status::Error("roots have non-zero level");
+  }
+  CellSlice cs(NoVm(), std::move(update));
+  if (cs.special_type() != Cell::SpecialType::MerkleUpdate) {
+    return td::Status::Error("not a MerkleUpdate special cell");
+  }
+  auto update_from = cs.fetch_ref();
+  auto update_to = cs.fetch_ref();
+  return detail::MerkleUpdateValidateApply().apply(std::move(from), std::move(update_from), std::move(update_to), 0, 0,
+                                                   hint);
 }
 
 td::Result<Ref<Cell>> MerkleUpdate::apply_raw(Ref<Cell> from, Ref<Cell> update_from, Ref<Cell> update_to,
