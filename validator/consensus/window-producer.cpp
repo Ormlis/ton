@@ -15,6 +15,42 @@
 
 namespace ton::validator::consensus {
 
+Collation start_collation(BusHandle bus_handle, const ProduceWindowContext& ctx, const ChainStateRef& state,
+                         td::uint32 slot, td::Timestamp slot_start,
+                         td::PersistentTreap<td::Bits256, td::Unit> processed_external_messages, bool speculative) {
+  auto& bus = *bus_handle;
+  auto roots = std::make_shared<CandidateRoots>();
+  CollateParams params{
+      .shard = bus.shard,
+      .prev = state->block_ids(),
+      .creator = Ed25519_PublicKey{ctx.leader.key.ed25519_value().raw()},
+      .first_in_window = slot == ctx.start_slot,
+      .speculative = speculative,
+      .utime = slot_start.at_unix(),
+      .hard_timeout = slot_start + std::max(ctx.target_rate * 3, std::chrono::milliseconds(60'000)),
+      .prev_block_data = state->block_data(),
+      .prev_block_state_roots = state->state(),
+      .processed_external_messages = std::move(processed_external_messages),
+      .candidate_roots = roots,
+  };
+  if (bus.shard.is_masterchain()) {
+    params.soft_timeout = slot_start + ctx.target_rate;
+  } else {
+    params.soft_timeout = slot_start;
+    params.wait_externals_until = slot_start;
+  }
+  if (ctx.collator_node_id) {
+    params.collator_node_id = *ctx.collator_node_id;
+  }
+  // Timestamped before the dispatch, so the mark is when collation was launched rather than
+  // when the manager's queue got around to it; published after it, so no observer or reporter
+  // turn is enqueued ahead of the request it is timing.
+  auto collate_started = stats::CollateStarted::create(slot, slot_start);
+  auto result = td::actor::ask(bus.manager, &ManagerFacade::collate_block, std::move(params), ctx.cancellation_token);
+  bus_handle.publish<TraceEvent>(std::move(collate_started));
+  return Collation{std::move(result), std::move(roots)};
+}
+
 td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx) {
   auto& bus = *bus_handle;
 
@@ -26,7 +62,14 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
   td::uint32 block_generation_target_slot = 0;
   td::PersistentTreap<td::Bits256, td::Unit> processed_external_messages;
 
-  std::chrono::milliseconds hard_timeout = std::max(ctx.target_rate * 3, std::chrono::milliseconds(60'000));
+  if (ctx.initial_collation) {
+    block_generation_active = true;
+    block_generation_target_slot = ctx.start_slot;
+    block_generation = std::move(ctx.initial_collation->result);
+    block_generation_roots = std::move(ctx.initial_collation->roots);
+    ctx.initial_collation.reset();
+  }
+
   std::chrono::milliseconds start_collate_before =
       bus.shard.is_masterchain() ? std::chrono::milliseconds(0) : ctx.target_rate;
   td::Timestamp slot_start = ctx.start_time;
@@ -40,35 +83,9 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
     if (!block_generation_active && (!ctx.should_generate_empty_block(state) || is_first_block)) {
       block_generation_active = true;
       block_generation_target_slot = slot;
-      block_generation_roots = std::make_shared<CandidateRoots>();
-      CollateParams params{
-          .shard = bus.shard,
-          .prev = state->block_ids(),
-          .creator = Ed25519_PublicKey{ctx.leader.key.ed25519_value().raw()},
-          .first_in_window = slot == ctx.start_slot,
-          .utime = slot_start.at_unix(),
-          .hard_timeout = slot_start + hard_timeout,
-          .prev_block_data = state->block_data(),
-          .prev_block_state_roots = state->state(),
-          .processed_external_messages = processed_external_messages,
-          .candidate_roots = block_generation_roots,
-      };
-      if (bus.shard.is_masterchain()) {
-        params.soft_timeout = slot_start + ctx.target_rate;
-      } else {
-        params.soft_timeout = slot_start;
-        params.wait_externals_until = slot_start;
-      }
-      if (ctx.collator_node_id) {
-        params.collator_node_id = *ctx.collator_node_id;
-      }
-      // Timestamped before the dispatch, so the mark is when collation was launched rather than
-      // when the manager's queue got around to it; published after it, so no observer or reporter
-      // turn is enqueued ahead of the request it is timing.
-      auto collate_started = stats::CollateStarted::create(slot, slot_start);
-      block_generation =
-          td::actor::ask(bus.manager, &ManagerFacade::collate_block, std::move(params), ctx.cancellation_token);
-      bus_handle.publish<TraceEvent>(std::move(collate_started));
+      auto collation = start_collation(bus_handle, ctx, state, slot, slot_start, processed_external_messages);
+      block_generation = std::move(collation.result);
+      block_generation_roots = std::move(collation.roots);
     }
     co_await td::actor::coro_sleep(slot_start);
 
@@ -164,6 +181,10 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
     bus_handle.publish<CandidateGenerated>(candidate, roots);
     bus_handle.publish<CandidateReceived>(candidate, std::move(roots));
     bus_handle.publish<TraceEvent>(stats::CandidateReceived::create(candidate, true));
+    if (generated_candidate && !generated_candidate->bad_ext_msgs.empty()) {
+      td::actor::send_closure(bus.manager, &ManagerFacade::complete_external_messages,
+                              std::move(generated_candidate->bad_ext_msgs));
+    }
     parent = id;
 
     slot_start += ctx.target_rate;

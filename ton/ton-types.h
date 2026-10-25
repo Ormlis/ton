@@ -469,12 +469,15 @@ struct GeneratedCandidate {
   // Zero means an older or synthetic producer did not provide the timestamp.
   double collated_at_monotonic = 0.0;
   td::PersistentTreap<td::Bits256, td::Unit> processed_external_messages = {};
+  // Local cleanup deferred by speculative collation until the candidate is used.
+  std::vector<Bits256> bad_ext_msgs = {};
 
   GeneratedCandidate clone() const {
     return GeneratedCandidate{
         .candidate = candidate.clone(),
         .collated_at_monotonic = collated_at_monotonic,
         .processed_external_messages = processed_external_messages,
+        .bad_ext_msgs = bad_ext_msgs,
     };
   }
 };

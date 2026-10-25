@@ -104,12 +104,20 @@ struct SaveCertificate {
   std::string contents_to_string() const;
 };
 
+// A locally validated candidate. This only prepares state; it does not certify the candidate.
+struct PrepareState {
+  using ReturnType = ResolveState::Result;
+
+  CandidateRef candidate;
+};
+
 class Bus : public consensus::Bus {
  public:
   using Parent = consensus::Bus;
   using Events =
       td::TypeList<BroadcastVote, NotarizationObserved, FinalizationObserved, LeaderWindowObserved, WaitForParent,
-                   ResolveCandidate, CandidateOutcomeObserved, StoreCandidate, ResolveState, SaveCertificate>;
+                   ResolveCandidate, CandidateOutcomeObserved, StoreCandidate, ResolveState, PrepareState,
+                   SaveCertificate>;
 
   Bus() = default;
 

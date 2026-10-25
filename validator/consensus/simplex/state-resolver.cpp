@@ -78,6 +78,11 @@ class StateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
     co_return co_await resolve_state(request->id);
   }
 
+  template <>
+  td::actor::Task<ResolvedState> process(BusHandle, std::shared_ptr<PrepareState> request) {
+    co_return co_await resolve_state(request->candidate->id, request->candidate);
+  }
+
  private:
   // ===== State resolution =====
   struct CachedState {
@@ -91,7 +96,7 @@ class StateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
 
   std::map<ParentId, CachedState> state_cache_;
 
-  td::actor::Task<ResolvedState> resolve_state(ParentId id) {
+  td::actor::Task<ResolvedState> resolve_state(ParentId id, CandidateRef candidate = {}) {
     CachedState& entry = state_cache_[id];
     if (entry.result.has_value()) {
       co_return *entry.result;
@@ -100,7 +105,7 @@ class StateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
     entry.promises.push_back(std::move(promise));
     if (!entry.started) {
       entry.started = true;
-      auto result = co_await resolve_state_inner(id).wrap();
+      auto result = co_await resolve_state_inner(id, std::move(candidate)).wrap();
       for (auto& p : entry.promises) {
         p.set_result(result.clone());
       }
@@ -119,15 +124,17 @@ class StateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
     return it != finalized_blocks_.end() && it->second.done;
   }
 
-  td::actor::Task<ResolvedState> resolve_state_inner(ParentId id) {
+  td::actor::Task<ResolvedState> resolve_state_inner(ParentId id, CandidateRef candidate) {
     if (!id.has_value()) {
       auto genesis = co_await genesis_.get();
-      auto state =
-          co_await ChainState::from_manager(owning_bus()->manager, owning_bus()->shard, genesis->state->block_ids());
-      co_return ResolvedState{state, std::nullopt};
+      co_return ResolvedState{genesis->state, std::nullopt};
     }
 
-    auto candidate = (co_await owning_bus().publish<ResolveCandidate>(*id)).candidate;
+    if (candidate.is_null()) {
+      candidate = (co_await owning_bus().publish<ResolveCandidate>(*id)).candidate;
+    } else {
+      CHECK(candidate->id == *id);
+    }
     if (candidate->is_empty()) {
       co_return co_await resolve_state(candidate->parent_id);
     }

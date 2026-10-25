@@ -49,6 +49,11 @@ struct EmptyBlockPolicy {
   td::Timestamp last_consensus_finalized_at;
 };
 
+struct Collation {
+  td::actor::StartedTask<GeneratedCandidate> result;
+  std::shared_ptr<CandidateRoots> roots;
+};
+
 struct ProduceWindowContext {
   ParentId base;
   ChainStateRef state;
@@ -67,7 +72,13 @@ struct ProduceWindowContext {
   std::function<bool()> is_superseded;
   std::function<bool(const ChainStateRef&)> should_generate_empty_block;
   std::function<bool()> allow_empty_on_generation_failure;
+
+  std::optional<Collation> initial_collation;
 };
+
+Collation start_collation(BusHandle bus, const ProduceWindowContext& ctx, const ChainStateRef& state, td::uint32 slot,
+                         td::Timestamp slot_start, td::PersistentTreap<td::Bits256, td::Unit> processed_external_messages,
+                         bool speculative = false);
 
 td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx);
 

@@ -56,6 +56,17 @@ struct OurLeaderWindowUpcoming {
   std::string contents_to_string() const;
 };
 
+// A possible next window, before consensus has authorized signing or publication.
+struct OurLeaderWindowPrepared {
+  CandidateId base;
+  ChainStateRef state;
+  td::uint32 start_slot;
+  td::Timestamp start_time;
+  td::CancellationToken cancellation_token;
+
+  std::string contents_to_string() const;
+};
+
 struct CandidateGenerated {
   CandidateRef candidate;
   std::shared_ptr<const CandidateRoots> roots = {};
@@ -205,7 +216,8 @@ class Db {
 class Bus : public td::actor::Bus {
  public:
   using Events = td::TypeList<Start, StopRequested, FinalizeBlock, OurLeaderWindowStarted, OurLeaderWindowUpcoming,
-                              CandidateGenerated, CandidateReceived, ValidationRequest, IncomingProtocolMessage,
+                              OurLeaderWindowPrepared, CandidateGenerated, CandidateReceived, ValidationRequest,
+                              IncomingProtocolMessage,
                               OutgoingProtocolMessage, IncomingCandidateRequest, IncomingCollatorRequest,
                               OutgoingOverlayRequest, BlockFinalizedInMasterchain, MisbehaviorReport, TraceEvent,
                               NoncriticalParamsUpdated, ValidatorOptionsUpdated, PrecheckCandidateBroadcast>;

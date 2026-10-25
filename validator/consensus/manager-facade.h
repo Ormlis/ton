@@ -30,6 +30,9 @@ class ManagerFacade : public td::actor::Actor {
   virtual void cache_block_candidate(BlockCandidate candidate) {
   }
 
+  virtual void complete_external_messages(std::vector<ExtMessage::Hash> to_delete) {
+  }
+
   virtual void send_block_candidate_broadcast(BlockIdExt id, td::BufferSlice data, int mode) {
   }
 

@@ -114,6 +114,7 @@ class ConsensusImpl : public td::actor::SpawnsWith<Bus>, public td::actor::Conne
 
   template <>
   void handle(BusHandle, std::shared_ptr<const StopRequested>) {
+    preparation_source_.cancel();
     stop();
   }
 
@@ -135,6 +136,11 @@ class ConsensusImpl : public td::actor::SpawnsWith<Bus>, public td::actor::Conne
   template <>
   void handle(BusHandle, std::shared_ptr<const LeaderWindowObserved> event) {
     auto& bus = *owning_bus();
+    if (prepared_base_ && event->start_slot >= prepared_base_->slot + 1 &&
+        (event->start_slot != prepared_base_->slot + 1 || event->base != prepared_base_)) {
+      preparation_source_.cancel();
+      prepared_base_.reset();
+    }
     td::uint32 new_window = event->start_slot / slots_per_leader_window_;
     current_window_ = new_window;
 
@@ -228,20 +234,51 @@ class ConsensusImpl : public td::actor::SpawnsWith<Bus>, public td::actor::Conne
   }
 
  private:
-  td::actor::Task<> start_generation(ParentId base, td::uint32 start_slot) {
-    auto parent = co_await owning_bus().publish<ResolveState>(base);
+  td::Timestamp generation_start_time(const ResolveState::Result& parent) const {
     td::Timestamp start_time = td::Timestamp::now();
     if (parent.gen_utime_exact.has_value()) {
       start_time = std::max(start_time, td::Timestamp::at_unix(*parent.gen_utime_exact) + params_.target_rate);
       start_time = std::min(start_time, td::Timestamp::in(params_.target_rate));
     }
+    return start_time;
+  }
+
+  td::actor::Task<> start_generation(ParentId base, td::uint32 start_slot) {
+    auto parent = co_await owning_bus().publish<ResolveState>(base);
 
     if (current_window_ != start_slot / slots_per_leader_window_) {
       co_return {};
     }
 
     owning_bus().publish<OurLeaderWindowStarted>(base, parent.state, start_slot, start_slot + slots_per_leader_window_,
-                                                 start_time);
+                                                 generation_start_time(parent));
+    co_return {};
+  }
+
+  void prepare_generation(CandidateRef candidate) {
+    auto& bus = *owning_bus();
+    td::uint32 start_slot = candidate->id.slot + 1;
+    if (bus.is_masterchain() || start_slot != (current_window_ + 1) * slots_per_leader_window_ ||
+        !bus.collator_schedule->is_expected_collator(bus.local_id->idx, start_slot)) {
+      return;
+    }
+    auto collators = bus.validator_opts.load()->get_collators_list();
+    if (collators->disable_self_collate || !collators->collators.empty()) {
+      return;
+    }
+
+    prepared_base_ = candidate->id;
+    preparation_source_ = td::CancellationTokenSource();
+    prepare_generation_inner(std::move(candidate), preparation_source_.get_cancellation_token()).start().detach();
+  }
+
+  td::actor::Task<> prepare_generation_inner(CandidateRef candidate, td::CancellationToken token) {
+    auto base = candidate->id;
+    auto parent = co_await owning_bus().publish<PrepareState>(std::move(candidate));
+    if (!token && base.slot / slots_per_leader_window_ == current_window_) {
+      owning_bus().publish<OurLeaderWindowPrepared>(base, parent.state, base.slot + 1,
+                                                    generation_start_time(parent), token);
+    }
     co_return {};
   }
 
@@ -281,6 +318,7 @@ class ConsensusImpl : public td::actor::SpawnsWith<Bus>, public td::actor::Conne
         .gen_utime_exact =
             candidate->is_empty() ? parent.gen_utime_exact : validation_result.get<CandidateAccept>().ok_from_utime,
     });
+    prepare_generation(candidate);
     co_await std::move(store_candidate);
 
     // When we validated block after wait_for_parent_optimistic, we still need WaitForParent before voting
@@ -390,6 +428,8 @@ class ConsensusImpl : public td::actor::SpawnsWith<Bus>, public td::actor::Conne
   bool previous_window_had_skip_ = false;
   std::optional<State> state_;
   td::uint32 current_window_ = 0;
+  ParentId prepared_base_;
+  td::CancellationTokenSource preparation_source_;
 
   struct ValidatedBlockInfo {
     CandidateId candidate_id;

@@ -67,6 +67,7 @@ class BlockProducerImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
   void handle(BusHandle, std::shared_ptr<const StopRequested>) {
     current_leader_window_ = std::nullopt;
     cancellation_source_.cancel();
+    prepared_collation_.reset();
     stop();
   }
 
@@ -84,16 +85,40 @@ class BlockProducerImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
     last_our_leader_window_ = event->start_slot;
     current_leader_window_ = event->start_slot;
     if (delegated_windows_.contains(event->start_slot)) {
+      prepared_collation_.reset();
       LOG(INFO) << "Window " << event->start_slot << " is delegated to "
                 << delegated_windows_.at(event->start_slot).collator << ", not producing";
       return;
     }
     if (!allow_self_collate_) {
+      prepared_collation_.reset();
       LOG(WARNING) << "Window " << event->start_slot << " is not delegated to collator, self collation is not allowed";
       return;
     }
     cancellation_source_ = td::CancellationTokenSource();
     generate_candidates(event).start().detach();
+  }
+
+  template <>
+  void handle(BusHandle bus, std::shared_ptr<const OurLeaderWindowPrepared> event) {
+    if (bus->is_masterchain() || !allow_self_collate_ || !collator_nodes_.empty() || event->cancellation_token ||
+        delegated_windows_.contains(event->start_slot) || last_our_leader_window_ >= event->start_slot ||
+        empty_block_policy_.should_generate_empty_block(false, event->state)) {
+      return;
+    }
+    ProduceWindowContext ctx{
+        .base = event->base,
+        .state = event->state,
+        .start_slot = event->start_slot,
+        .end_slot = event->start_slot + bus->config.slots_per_leader_window,
+        .start_time = event->start_time,
+        .leader = *bus->local_id,
+        .signing_key = bus->local_id->short_id,
+        .target_rate = target_rate_,
+        .cancellation_token = event->cancellation_token,
+    };
+    auto collation = start_collation(bus, ctx, event->state, event->start_slot, event->start_time, {}, true);
+    prepared_collation_.emplace(PreparedCollation{std::move(event), std::move(collation)});
   }
 
   template <>
@@ -270,6 +295,14 @@ class BlockProducerImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
         .allow_empty_on_generation_failure =
             [&] { return empty_block_policy_.allow_empty_on_generation_failure(no_empty_blocks_on_error_timeout_); },
     };
+    if (prepared_collation_) {
+      const auto& prepared = *prepared_collation_->window;
+      if (prepared.start_slot == event->start_slot && prepared.base == event->base && !prepared.cancellation_token &&
+          !ctx.should_generate_empty_block(event->state)) {
+        ctx.initial_collation = std::move(prepared_collation_->collation);
+      }
+      prepared_collation_.reset();
+    }
     co_await produce_window(owning_bus(), std::move(ctx));
 
     if (current_leader_window_ == window) {
@@ -311,6 +344,12 @@ class BlockProducerImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
   std::optional<td::uint32> current_leader_window_;
   std::optional<td::uint32> last_our_leader_window_;
   td::CancellationTokenSource cancellation_source_;
+
+  struct PreparedCollation {
+    std::shared_ptr<const OurLeaderWindowPrepared> window;
+    Collation collation;
+  };
+  std::optional<PreparedCollation> prepared_collation_;
 
   std::vector<adnl::AdnlNodeIdShort> collator_nodes_;
   bool allow_self_collate_ = true;

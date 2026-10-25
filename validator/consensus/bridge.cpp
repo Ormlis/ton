@@ -95,6 +95,10 @@ class ManagerFacadeImpl : public ManagerFacade {
                             BroadcastSource::consensus_overlay, [](td::Result<>) {});
   }
 
+  void complete_external_messages(std::vector<ExtMessage::Hash> to_delete) override {
+    td::actor::send_closure(manager_, &ValidatorManager::complete_external_messages, std::move(to_delete));
+  }
+
   void send_block_candidate_broadcast(BlockIdExt id, td::BufferSlice data, int mode) override {
     td::actor::send_closure(manager_, &ValidatorManager::send_block_candidate_broadcast, id,
                             validator_set_->get_catchain_seqno(), validator_set_->get_validator_set_hash(),

@@ -93,6 +93,10 @@ std::string OurLeaderWindowUpcoming::contents_to_string() const {
   return PSTRING() << "{start_slot=" << start_slot << "}";
 }
 
+std::string OurLeaderWindowPrepared::contents_to_string() const {
+  return PSTRING() << "{base=" << base << ", start_slot=" << start_slot << "}";
+}
+
 std::string CandidateGenerated::contents_to_string() const {
   return PSTRING() << "{candidate=" << candidate_to_string(candidate) << "}";
 }

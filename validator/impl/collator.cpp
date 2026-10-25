@@ -6297,7 +6297,7 @@ bool Collator::publish_block_candidate(td::BufferSlice blk_slice, td::BufferSlic
   // 4. finish collation
   td::actor::send_closure_later(actor_id(this), &Collator::return_block_candidate);
   // 5. communicate about bad and delayed external messages
-  if (!bad_ext_msgs_.empty()) {
+  if (!params_.speculative && !bad_ext_msgs_.empty()) {
     LOG(INFO) << "sending complete_external_messages() to Manager";
     td::actor::send_closure_later(manager, &ValidatorManager::complete_external_messages, std::move(bad_ext_msgs_));
   }
@@ -6331,6 +6331,7 @@ void Collator::return_block_candidate() {
       .candidate = block_candidate->clone(),
       .collated_at_monotonic = td::Timestamp::now().at(),
       .processed_external_messages = processed_external_messages_,
+      .bad_ext_msgs = params_.speculative ? std::move(bad_ext_msgs_) : std::vector<ExtMessage::Hash>{},
   });
   busy_ = false;
   stop();
