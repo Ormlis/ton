@@ -255,7 +255,7 @@ class ConsensusImpl : public td::actor::SpawnsWith<Bus>, public td::actor::Conne
     co_return {};
   }
 
-  void prepare_generation(CandidateRef candidate) {
+  void prepare_generation(CandidateRef candidate, std::shared_ptr<const CandidateRoots> roots, double gen_utime_exact) {
     auto& bus = *owning_bus();
     td::uint32 start_slot = candidate->id.slot + 1;
     if (bus.is_masterchain() || start_slot != (current_window_ + 1) * slots_per_leader_window_ ||
@@ -269,12 +269,14 @@ class ConsensusImpl : public td::actor::SpawnsWith<Bus>, public td::actor::Conne
 
     prepared_base_ = candidate->id;
     preparation_source_ = td::CancellationTokenSource();
-    prepare_generation_inner(std::move(candidate), preparation_source_.get_cancellation_token()).start().detach();
+    prepare_generation_inner(std::move(candidate), std::move(roots), gen_utime_exact,
+                               preparation_source_.get_cancellation_token()).start().detach();
   }
 
-  td::actor::Task<> prepare_generation_inner(CandidateRef candidate, td::CancellationToken token) {
+  td::actor::Task<> prepare_generation_inner(CandidateRef candidate, std::shared_ptr<const CandidateRoots> roots,
+                                             double gen_utime_exact, td::CancellationToken token) {
     auto base = candidate->id;
-    auto parent = co_await owning_bus().publish<PrepareState>(std::move(candidate));
+    auto parent = co_await owning_bus().publish<PrepareState>(std::move(candidate), std::move(roots), gen_utime_exact);
     if (!token && base.slot / slots_per_leader_window_ == current_window_) {
       owning_bus().publish<OurLeaderWindowPrepared>(base, parent.state, base.slot + 1,
                                                     generation_start_time(parent), token);
@@ -304,7 +306,7 @@ class ConsensusImpl : public td::actor::SpawnsWith<Bus>, public td::actor::Conne
     }
 
     auto validation_result = co_await owning_bus().publish<ValidationRequest>(
-        candidate, parent.prev_block_ids, parent.prev_state_roots, parent.is_prev_normal_tip, std::move(roots));
+        candidate, parent.prev_block_ids, parent.prev_state_roots, parent.is_prev_normal_tip, roots);
 
     if (validation_result.has<CandidateReject>()) {
       LOG(WARNING) << "Candidate " << candidate->id
@@ -318,7 +320,7 @@ class ConsensusImpl : public td::actor::SpawnsWith<Bus>, public td::actor::Conne
         .gen_utime_exact =
             candidate->is_empty() ? parent.gen_utime_exact : validation_result.get<CandidateAccept>().ok_from_utime,
     });
-    prepare_generation(candidate);
+    prepare_generation(candidate, std::move(roots), validation_result.get<CandidateAccept>().ok_from_utime);
     co_await std::move(store_candidate);
 
     // When we validated block after wait_for_parent_optimistic, we still need WaitForParent before voting

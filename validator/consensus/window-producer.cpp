@@ -141,7 +141,7 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
       }
       td::actor::send_closure(bus.manager, &ManagerFacade::cache_block_candidate,
                               generated_candidate->candidate.clone());
-      state = state->apply(generated_candidate->candidate);
+      state = state->apply(generated_candidate->candidate, roots.get());
       id = CandidateHashData::create_full(generated_candidate->candidate, parent).build_id_with(slot);
       double finished_at_monotonic = generated_candidate->collated_at_monotonic;
       if (!std::isfinite(finished_at_monotonic) || finished_at_monotonic <= 0.0) {

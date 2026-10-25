@@ -80,7 +80,7 @@ class StateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
 
   template <>
   td::actor::Task<ResolvedState> process(BusHandle, std::shared_ptr<PrepareState> request) {
-    co_return co_await resolve_state(request->candidate->id, request->candidate);
+    co_return co_await resolve_state(request->candidate->id, request->candidate, request->roots, request->gen_utime_exact);
   }
 
  private:
@@ -96,7 +96,9 @@ class StateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
 
   std::map<ParentId, CachedState> state_cache_;
 
-  td::actor::Task<ResolvedState> resolve_state(ParentId id, CandidateRef candidate = {}) {
+  td::actor::Task<ResolvedState> resolve_state(ParentId id, CandidateRef candidate = {},
+                                              std::shared_ptr<const CandidateRoots> roots = {},
+                                              std::optional<double> gen_utime_exact = std::nullopt) {
     CachedState& entry = state_cache_[id];
     if (entry.result.has_value()) {
       co_return *entry.result;
@@ -105,7 +107,7 @@ class StateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
     entry.promises.push_back(std::move(promise));
     if (!entry.started) {
       entry.started = true;
-      auto result = co_await resolve_state_inner(id, std::move(candidate)).wrap();
+      auto result = co_await resolve_state_inner(id, std::move(candidate), std::move(roots), gen_utime_exact).wrap();
       for (auto& p : entry.promises) {
         p.set_result(result.clone());
       }
@@ -124,21 +126,28 @@ class StateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
     return it != finalized_blocks_.end() && it->second.done;
   }
 
-  td::actor::Task<ResolvedState> resolve_state_inner(ParentId id, CandidateRef candidate) {
+  td::actor::Task<ResolvedState> resolve_state_inner(ParentId id, CandidateRef candidate,
+                                                    std::shared_ptr<const CandidateRoots> roots,
+                                                    std::optional<double> gen_utime_exact) {
     if (!id.has_value()) {
       auto genesis = co_await genesis_.get();
       co_return ResolvedState{genesis->state, std::nullopt};
     }
 
     if (candidate.is_null()) {
-      candidate = (co_await owning_bus().publish<ResolveCandidate>(*id)).candidate;
+      auto resolved = co_await owning_bus().publish<ResolveCandidate>(*id);
+      candidate = std::move(resolved.candidate);
+      roots = std::move(resolved.roots);
+      gen_utime_exact = resolved.gen_utime_exact;
     } else {
       CHECK(candidate->id == *id);
     }
     if (candidate->is_empty()) {
       co_return co_await resolve_state(candidate->parent_id);
     }
-    auto gen_utime_exact = get_candidate_gen_utime_exact(std::get<BlockCandidate>(candidate->block)).move_as_ok();
+    if (!gen_utime_exact.has_value()) {
+      gen_utime_exact = get_candidate_gen_utime_exact(std::get<BlockCandidate>(candidate->block), roots.get()).move_as_ok();
+    }
 
     if (is_finalized(*id)) {
       auto genesis = co_await genesis_.get();
@@ -149,7 +158,7 @@ class StateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
 
     auto prev_data_state = co_await resolve_state(candidate->parent_id);
     co_return ResolvedState{
-        .state = prev_data_state.state->apply(std::get<BlockCandidate>(candidate->block)),
+        .state = prev_data_state.state->apply(std::get<BlockCandidate>(candidate->block), roots.get()),
         .gen_utime_exact = gen_utime_exact,
     };
   }
@@ -195,7 +204,8 @@ class StateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
       co_return {};
     }
 
-    auto [candidate, notar_cert] = co_await owning_bus().publish<ResolveCandidate>(id);
+    auto [candidate, notar_cert, roots, gen_utime_exact] = co_await owning_bus().publish<ResolveCandidate>(id);
+    roots.reset();
     if (final_cert && !final_candidate) {
       CHECK((*final_cert)->vote.id == id);
       final_candidate = candidate;

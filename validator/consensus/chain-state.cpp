@@ -106,9 +106,14 @@ BlockIdExt ChainState::assert_normal() const {
 }
 #endif
 
-td::Ref<ChainState> ChainState::apply(const BlockCandidate& candidate) const {
+td::Ref<ChainState> ChainState::apply(const BlockCandidate& candidate, const CandidateRoots* roots) const {
   try {
-    auto block = create_block(candidate.id, candidate.data.clone()).move_as_ok();
+    if (roots) {
+      CHECK(roots->block_file_hash == candidate.id.file_hash);
+      CHECK(roots->block_root.not_null());
+    }
+    auto block = create_block(candidate.id, candidate.data.clone(), roots ? roots->block_root : td::Ref<vm::Cell>{})
+                     .move_as_ok();
 
     block::gen::Block::Record rec;
     bool rc = block::gen::unpack_cell(block->root_cell(), rec);

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: LGPL-2.0-or-later
  */
 
+#include "consensus/utils.h"
 #include "td/utils/Random.h"
 #include "validator/rate-limiter.h"
 
@@ -82,9 +83,10 @@ struct CandidateAndCert {
     return candidate.has_value() && notar_cert.has_value();
   }
 
-  ResolveCandidate::Result as_resolution_result() const {
+  ResolveCandidate::Result as_resolution_result(std::shared_ptr<const CandidateRoots> roots,
+                                                  std::optional<double> gen_utime_exact) const {
     CHECK(is_complete());
-    return {*candidate, *notar_cert};
+    return {*candidate, *notar_cert, std::move(roots), gen_utime_exact};
   }
 
   tl::RequestCandidateRef make_request(CandidateId id) const {
@@ -164,7 +166,7 @@ class CandidateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::acto
 
     if (state.candidate_and_cert.is_complete()) {
       publish_candidate_outcome_if_known(state);
-      co_return state.candidate_and_cert.as_resolution_result();
+      co_return state.candidate_and_cert.as_resolution_result(state.roots.lock(), state.gen_utime_exact);
     }
 
     auto [task, promise] = td::actor::StartedTask<td::Unit>::make_bridge();
@@ -176,7 +178,7 @@ class CandidateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::acto
 
     co_await std::move(task);
     publish_candidate_outcome_if_known(state);
-    co_return state.candidate_and_cert.as_resolution_result();
+    co_return state.candidate_and_cert.as_resolution_result(state.roots.lock(), state.gen_utime_exact);
   }
 
   template <>
@@ -184,6 +186,16 @@ class CandidateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::acto
     auto &state = state_[request->candidate->id];
 
     state.candidate_and_cert.candidate = request->candidate;
+    if (request->roots) {
+      state.roots = request->roots;
+      if (!request->candidate->is_empty() && !state.gen_utime_exact.has_value()) {
+        auto gen_utime_exact = get_candidate_gen_utime_exact(std::get<BlockCandidate>(request->candidate->block),
+                                                            request->roots.get());
+        if (gen_utime_exact.is_ok()) {
+          state.gen_utime_exact = gen_utime_exact.move_as_ok();
+        }
+      }
+    }
     maybe_resume_resolve_awaiters(state);
 
     if (state.candidate_stored) {
@@ -219,6 +231,9 @@ class CandidateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::acto
     bool candidate_stored = false;
     bool candidate_outcome_published = false;
     CandidateAndCert candidate_and_cert;
+    // Reuse live local roots without retaining every decoded candidate for the whole session.
+    std::weak_ptr<const CandidateRoots> roots;
+    std::optional<double> gen_utime_exact;
 
     std::vector<td::Promise<td::Unit>> resolve_awaiters;
     std::vector<td::Promise<td::Unit>> store_awaiters;

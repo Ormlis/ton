@@ -129,7 +129,7 @@ class ChainState : public td::CntObject {
   std::optional<BlockIdExt> as_normal() const;
   BlockIdExt assert_normal() const;
 
-  td::Ref<ChainState> apply(const BlockCandidate& candidate) const;
+  td::Ref<ChainState> apply(const BlockCandidate& candidate, const CandidateRoots* roots = nullptr) const;
 
  private:
   Tip tip_;

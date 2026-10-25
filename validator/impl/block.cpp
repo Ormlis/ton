@@ -27,7 +27,8 @@ using td::Ref;
 BlockQ::BlockQ(const BlockQ& other) : data_(other.data_.clone()), id_(other.id_), root_(other.root_), boc_(other.boc_) {
 }
 
-BlockQ::BlockQ(BlockIdExt id, td::BufferSlice data) : data_(std::move(data)), id_(id) {
+BlockQ::BlockQ(BlockIdExt id, td::BufferSlice data, Ref<vm::Cell> root)
+    : data_(std::move(data)), id_(id), root_(std::move(root)) {
 }
 
 BlockQ::~BlockQ() {
@@ -35,6 +36,9 @@ BlockQ::~BlockQ() {
 
 td::Status BlockQ::init() {
   if (root_.not_null()) {
+    if (RootHash{root_->get_hash().bits()} != id_.root_hash) {
+      return td::Status::Error(-668, "root hash mismatch");
+    }
     return td::Status::OK();
   }
   if (data_.is_null()) {
@@ -68,8 +72,8 @@ td::Status BlockQ::init() {
   return td::Status::OK();
 }
 
-td::Result<td::Ref<BlockQ>> BlockQ::create(BlockIdExt id, td::BufferSlice data) {
-  td::Ref<BlockQ> res{true, id, std::move(data)};
+td::Result<td::Ref<BlockQ>> BlockQ::create(BlockIdExt id, td::BufferSlice data, Ref<vm::Cell> root) {
+  td::Ref<BlockQ> res{true, id, std::move(data), std::move(root)};
   auto err = res.unique_write().init();
   if (err.is_error()) {
     return err.move_as_error();

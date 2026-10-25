@@ -55,6 +55,8 @@ struct ResolveCandidate {
   struct Result {
     CandidateRef candidate;
     NotarCertRef notar;
+    std::shared_ptr<const CandidateRoots> roots = {};
+    std::optional<double> gen_utime_exact = std::nullopt;
   };
 
   using ReturnType = Result;
@@ -109,6 +111,8 @@ struct PrepareState {
   using ReturnType = ResolveState::Result;
 
   CandidateRef candidate;
+  std::shared_ptr<const CandidateRoots> roots = {};
+  std::optional<double> gen_utime_exact = std::nullopt;
 };
 
 class Bus : public consensus::Bus {
