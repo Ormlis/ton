@@ -3574,46 +3574,6 @@ TEST(TonDb, CellStat) {
   }
 }
 
-TEST(TonDb, TentativeMerkleUpdateLeftStat) {
-  vm::CellBuilder root_builder;
-  for (int i = 0; i < 3; ++i) {
-    auto leaf = vm::CellBuilder().store_bytes(std::string(64, 'a' + i)).finalize();
-    root_builder.store_ref(vm::CellBuilder().store_bytes(std::string(64, 'A' + i)).store_ref(leaf).finalize());
-  }
-  auto root = root_builder.finalize();
-  for (unsigned accepted = 0; accepted <= 2; ++accepted) {
-    auto tree = std::make_shared<vm::CellUsageTree>(root);
-    vm::CellSlice cs(vm::NoVm(), vm::UsageCell::create(root, tree->root_ptr()));
-    std::vector<td::Ref<vm::Cell>> states;
-    for (unsigned i = 0; i < 3; ++i) {
-      auto child = vm::load_cell_slice(cs.prefetch_ref(i)).prefetch_ref();
-      states.push_back(vm::CellBuilder().store_ref(child).finalize());
-    }
-    vm::NewCellStorageStat committed;
-    vm::MerkleUpdateLeftStat committed_left;
-    committed.add_proof(states[0], tree.get(), &committed_left);
-    ASSERT_TRUE(committed_left.estimate_proof_size() > 0);
-    auto before = committed_left.estimate_proof_size();
-    td::uint64 expected = before;
-    {
-      vm::MerkleUpdateLeftStat tentative_left(&committed_left);
-      vm::NewCellStorageStat tentative(&committed);
-      for (unsigned i = 1; i < states.size(); ++i) {
-        tentative.add_proof(states[i], tree.get(), &tentative_left);
-        if (i == accepted) {
-          expected = tentative_left.estimate_proof_size();
-        }
-      }
-      ASSERT_TRUE(tentative_left.estimate_proof_size() > before);
-    }
-    ASSERT_EQ(committed_left.estimate_proof_size(), before);
-    for (unsigned i = 1; i <= accepted; ++i) {
-      committed.add_proof(states[i], tree.get(), &committed_left);
-    }
-    ASSERT_EQ(committed_left.estimate_proof_size(), expected);
-  }
-}
-
 TEST(TonDb, MerkleUpdateLeftStatUsagePaths) {
   auto leaf = vm::CellBuilder().store_bytes(std::string(64, 'x')).finalize();
   auto shared = vm::CellBuilder().store_ref(leaf).finalize();
@@ -3641,58 +3601,71 @@ TEST(TonDb, MerkleUpdateLeftStatUsagePaths) {
       trees[i]->add_path_to_proof_stat(node_id, stat);
       ASSERT_EQ(stat.estimate_proof_size(), expected.estimate_proof_size());
 
-      // Another estimator must still account for the same path in full.
-      vm::MerkleUpdateLeftStat independent, independent_expected;
-      trees[i]->add_path_to_proof_stat(node_id, independent);
-      independent_expected.add_loaded_cell(shared, 0);
-      independent_expected.add_loaded_cell(branches[j], 0);
-      independent_expected.add_loaded_cell(roots[i], 0);
-      ASSERT_EQ(independent.estimate_proof_size(), independent_expected.estimate_proof_size());
+      // Estimators sharing a tree also share the accounting of its paths.
+      vm::MerkleUpdateLeftStat other;
+      trees[i]->add_path_to_proof_stat(node_id, other);
+      ASSERT_EQ(other.estimate_proof_size(), 0u);
+      ASSERT_TRUE(!trees[i]->has_mark(trees[i]->root_id()));
     }
   }
 }
 
-TEST(TonDb, MerkleUpdateLeftStatParent) {
-  auto small = vm::CellBuilder().finalize();
-  auto large = vm::CellBuilder().store_bytes(std::string(64, 'a')).finalize();
-  auto branch = vm::CellBuilder().store_ref(small).store_ref(large).finalize();
-  auto root = vm::CellBuilder().store_ref(branch).store_ref(large).finalize();
-  auto proof = vm::CellBuilder::create_merkle_proof(root);
-  vm::MerkleUpdateLeftStat base;
-  base.add_loaded_cell(root, 0);
-  auto base_size = base.estimate_proof_size();
-  auto expected = base;
-  {
-    vm::MerkleUpdateLeftStat tentative(&base);
-    tentative.add_loaded_cell(branch, 0);
-    expected.add_loaded_cell(branch, 0);
-    ASSERT_EQ(tentative.estimate_proof_size(), expected.estimate_proof_size());
-    auto tentative_size = tentative.estimate_proof_size();
-    auto nested_expected = expected;
-    {
-      vm::MerkleUpdateLeftStat nested(&tentative);
-      for (const auto& cell : {large, small, root, proof, branch, small}) {
-        for (unsigned depth = 0; depth <= 1; ++depth) {
-          nested.add_loaded_cell(cell, depth);
-          nested_expected.add_loaded_cell(cell, depth);
-          ASSERT_EQ(nested.estimate_proof_size(), nested_expected.estimate_proof_size());
-        }
-      }
+TEST(TonDb, MerkleUpdateDoesNotRecordReads) {
+  for (unsigned bits : {32u, 512u}) {
+    auto first = vm::CellBuilder().store_zeroes(bits).finalize();
+    auto second = vm::CellBuilder().store_ones(bits).finalize();
+    auto root = vm::CellBuilder().store_ref(first).store_ref(second).finalize();
+    std::array<std::shared_ptr<vm::CellUsageTree>, 2> trees;
+    std::array<vm::CellUsageTree*, 2> tree_ptrs;
+    std::array<td::Ref<vm::Cell>, 2> children;
+    std::array<unsigned, 2> reads{};
+    for (unsigned i = 0; i < trees.size(); ++i) {
+      trees[i] = std::make_shared<vm::CellUsageTree>(root);
+      tree_ptrs[i] = trees[i].get();
+      children[i] = vm::load_cell_slice(vm::UsageCell::create(root, trees[i]->root_ptr())).prefetch_ref(i);
+      trees[i]->set_cell_load_callback([&, i](const vm::LoadedCell&) { ++reads[i]; });
     }
-    ASSERT_EQ(tentative.estimate_proof_size(), tentative_size);
-    tentative.add_loaded_cell(small, 0);
-    expected.add_loaded_cell(small, 0);
-    ASSERT_TRUE(tentative.estimate_proof_size() < tentative_size);
-    ASSERT_EQ(tentative.estimate_proof_size(), expected.estimate_proof_size());
-    tentative.add_loaded_cell(large, 0);
-    expected.add_loaded_cell(large, 0);
-    ASSERT_EQ(tentative.estimate_proof_size(), expected.estimate_proof_size());
+    auto next = vm::CellBuilder().store_long(1, 1).store_ref(children[0]).store_ref(children[1]).finalize();
+    // Preserve an outer suppression scope while also restoring the other tree.
+    trees[0]->set_ignore_loads(true);
+    vm::NewCellStorageStat stat;
+    vm::MerkleUpdateLeftStat left_stat, expected;
+    stat.set_additional_usage_trees({trees[1].get()});
+    stat.add_proof(next, trees[0].get(), &left_stat);
+    if (bits > 280) {
+      expected.add_loaded_cell(root, 0);
+    }
+    ASSERT_EQ(left_stat.estimate_proof_size(), expected.estimate_proof_size());
+    for (unsigned i = 0; i < trees.size(); ++i) {
+      ASSERT_EQ(reads[i], 0u);
+      ASSERT_TRUE(!trees[i]->is_loaded(children[i]->get_tree_node().node_id()));
+    }
+
+    auto new_proof = vm::MerkleUpdate::generate_to_raw(next, tree_ptrs).move_as_ok();
+    for (unsigned i = 0; i < trees.size(); ++i) {
+      ASSERT_EQ(reads[i], 0u);
+      ASSERT_TRUE(!trees[i]->is_loaded(children[i]->get_tree_node().node_id()));
+      ASSERT_EQ(trees[i]->has_mark(trees[i]->root_id()), bits > 280);
+    }
+    auto old_proof = vm::MerkleProof::combine_fast_raw(
+        vm::MerkleProof::generate_raw(root, trees[0].get(), true).move_as_ok(),
+        vm::MerkleProof::generate_raw(root, trees[1].get(), true).move_as_ok()).move_as_ok();
+    auto update = vm::CellBuilder::create_merkle_update(old_proof, new_proof);
+    vm::MerkleUpdate::validate(update).ensure();
+    // The update must also apply to a state proof with the children unread.
+    auto state_proof = vm::MerkleProof::generate(root, trees[0].get()).move_as_ok();
+    auto partial_state = vm::MerkleProof::virtualize(state_proof).move_as_ok();
+    ASSERT_EQ(vm::MerkleUpdate::apply(partial_state, update).move_as_ok()->get_hash(0), next->get_hash());
+
+    children[0]->load_cell().ensure();
+    ASSERT_EQ(reads[0], 0u);
+    trees[0]->set_ignore_loads(false);
+    for (unsigned i = 0; i < trees.size(); ++i) {
+      children[i]->load_cell().ensure();
+      ASSERT_EQ(reads[i], 1u);
+      ASSERT_TRUE(trees[i]->is_loaded(children[i]->get_tree_node().node_id()));
+    }
   }
-  ASSERT_EQ(base.estimate_proof_size(), base_size);
-  for (const auto& cell : {branch, small, large}) {
-    base.add_loaded_cell(cell, 0);
-  }
-  ASSERT_EQ(base.estimate_proof_size(), expected.estimate_proof_size());
 }
 
 struct String {
