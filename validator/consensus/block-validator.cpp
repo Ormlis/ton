@@ -106,6 +106,7 @@ class BlockValidatorImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
           .local_validator_id = bus.local_id->short_id,
           .require_full_collated_data = bus.config.full_collated_data_enabled,
           .prev_block_state_roots = event->prev_state_roots,
+          .candidate_roots = std::move(event->candidate_roots),
       };
       auto result = co_await td::actor::ask(bus.manager, &ManagerFacade::validate_block_candidate, block.clone(),
                                             std::move(validate_params), td::Timestamp::in(60.0));

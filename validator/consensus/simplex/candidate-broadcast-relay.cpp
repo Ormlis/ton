@@ -34,7 +34,7 @@ class CandidateBroadcastRelayImpl : public td::actor::SpawnsWith<Bus>, public td
   template <>
   void handle(BusHandle bus, std::shared_ptr<const CandidateReceived> event) {
     if (!bus->is_validator() && !bus->is_collator) {
-      bus.publish<StoreCandidate>(event->candidate).start().detach("store candidate");
+      bus.publish<StoreCandidate>(event->candidate, event->roots).start().detach("store candidate");
     }
     if (event->candidate->is_empty()) {
       return;

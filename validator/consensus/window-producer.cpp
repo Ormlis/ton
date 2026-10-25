@@ -22,6 +22,7 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
   ParentId parent = ctx.base;
   bool block_generation_active = false;
   td::actor::SharedFuture<GeneratedCandidate> block_generation;
+  std::shared_ptr<CandidateRoots> block_generation_roots;
   td::uint32 block_generation_target_slot = 0;
   td::PersistentTreap<td::Bits256, td::Unit> processed_external_messages;
 
@@ -39,6 +40,7 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
     if (!block_generation_active && (!ctx.should_generate_empty_block(state) || is_first_block)) {
       block_generation_active = true;
       block_generation_target_slot = slot;
+      block_generation_roots = std::make_shared<CandidateRoots>();
       CollateParams params{
           .shard = bus.shard,
           .prev = state->block_ids(),
@@ -49,6 +51,7 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
           .prev_block_data = state->block_data(),
           .prev_block_state_roots = state->state(),
           .processed_external_messages = processed_external_messages,
+          .candidate_roots = block_generation_roots,
       };
       if (bus.shard.is_masterchain()) {
         params.soft_timeout = slot_start + ctx.target_rate;
@@ -112,8 +115,13 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
 
     CandidateId id;
     std::variant<BlockIdExt, BlockCandidate> block;
+    std::shared_ptr<const CandidateRoots> roots;
     if (generated_candidate.has_value()) {
       CHECK(attempted_collation_target.has_value());
+      // Synthetic producers may return only serialized data.
+      if (block_generation_roots->block_root.not_null()) {
+        roots = std::move(block_generation_roots);
+      }
       td::actor::send_closure(bus.manager, &ManagerFacade::cache_block_candidate,
                               generated_candidate->candidate.clone());
       state = state->apply(generated_candidate->candidate);
@@ -153,8 +161,8 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
     if (ctx.is_superseded()) {
       break;
     }
-    bus_handle.publish<CandidateGenerated>(candidate);
-    bus_handle.publish<CandidateReceived>(candidate);
+    bus_handle.publish<CandidateGenerated>(candidate, roots);
+    bus_handle.publish<CandidateReceived>(candidate, std::move(roots));
     bus_handle.publish<TraceEvent>(stats::CandidateReceived::create(candidate, true));
     parent = id;
 

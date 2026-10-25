@@ -78,6 +78,7 @@ struct StoreCandidate {
   using ReturnType = td::Unit;
 
   CandidateRef candidate;
+  std::shared_ptr<const CandidateRoots> roots = {};
   std::string contents_to_string() const;
 };
 

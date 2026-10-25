@@ -22,6 +22,7 @@
 #include "interfaces/validator-manager.h"
 #include "td/actor/coro_utils.h"
 
+#include "candidate-roots.h"
 #include "validator.h"
 
 namespace ton {
@@ -58,6 +59,10 @@ struct CollateParams {
   // External messages from this set will be dropped
   // Collator adds new processed messages and returns the new set
   td::PersistentTreap<td::Bits256, td::Unit> processed_external_messages = {};
+
+  // Optional output for local reuse. Read only after successful collation;
+  // allocate a separate context for each concurrent request.
+  std::shared_ptr<CandidateRoots> candidate_roots = {};
 };
 
 struct ValidateParams {
@@ -74,6 +79,9 @@ struct ValidateParams {
   // Optional - if empty, states are taken from manager
   // If not empty, should be the same size as prev
   std::vector<Ref<vm::Cell>> prev_block_state_roots = {};
+
+  // Optional roots from the collator or transport. Released after unpacking.
+  std::shared_ptr<const CandidateRoots> candidate_roots = {};
 };
 
 td::actor::ActorOwn<Db> create_db_actor(td::actor::ActorId<ValidatorManager> manager, std::string db_root_,

@@ -58,6 +58,7 @@ struct OurLeaderWindowUpcoming {
 
 struct CandidateGenerated {
   CandidateRef candidate;
+  std::shared_ptr<const CandidateRoots> roots = {};
 
   std::string contents_to_string() const;
 };
@@ -65,6 +66,7 @@ struct CandidateGenerated {
 // The only guarantee is that the candidate has a valid signature from `candidate->leader`.
 struct CandidateReceived {
   CandidateRef candidate;
+  std::shared_ptr<const CandidateRoots> roots = {};
 
   std::string contents_to_string() const;
 };
@@ -76,6 +78,7 @@ struct ValidationRequest {
   std::vector<BlockIdExt> prev_block_ids;
   std::vector<Ref<vm::Cell>> prev_state_roots;  // optional - not required in basechain with full collated data
   bool is_prev_normal_tip;
+  std::shared_ptr<const CandidateRoots> candidate_roots = {};
 
   std::string contents_to_string() const;
   static std::string response_to_string(const ReturnType&);

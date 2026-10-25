@@ -180,7 +180,8 @@ class PrivateOverlayImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
       extra = create_serialize_tl_object<tl::broadcastExtraLegacy>(event->candidate->id.slot);
     }
     td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_with_extra, local_adnl_id_, overlay_id_,
-                            local_broadcast_src_, 0, event->candidate->serialize_for_broadcast(), std::move(extra));
+                            local_broadcast_src_, 0, event->candidate->serialize_for_broadcast(event->roots.get()),
+                            std::move(extra));
   }
 
  private:
@@ -262,14 +263,14 @@ class PrivateOverlayImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
                    << maybe_candidate.move_as_error();
       return;
     }
-    auto candidate = maybe_candidate.move_as_ok();
+    auto [candidate, roots] = maybe_candidate.move_as_ok();
 
     if (!candidate->is_empty()) {
       const BlockCandidate& block = std::get<BlockCandidate>(candidate->block);
       td::actor::send_closure(bus.manager, &ManagerFacade::cache_block_candidate, block.clone());
     }
 
-    owning_bus().publish<CandidateReceived>(std::move(candidate));
+    owning_bus().publish<CandidateReceived>(std::move(candidate), std::move(roots));
   }
 
   td::actor::Task<> precheck_broadcast(PublicKeyHash src, td::Bits256 broadcast_id, td::BufferSlice extra,

@@ -6,8 +6,11 @@
 
 #pragma once
 
+#include <memory>
+
 #include "auto/tl/ton_api.h"
 #include "td/utils/Status.h"
+#include "validator/candidate-roots.h"
 
 namespace ton::validator::consensus {
 
@@ -17,7 +20,13 @@ using payload = ton_api::validatorSession_candidate;
 
 }
 
-td::Result<td::BufferSlice> serialize_payload(const tl_object_ptr<tl::payload>& payload);
-td::Result<tl_object_ptr<tl::payload>> deserialize_payload(td::Slice data, int max_decompressed_data_size);
+struct DeserializedPayload {
+  tl_object_ptr<tl::payload> payload;
+  std::shared_ptr<const CandidateRoots> roots;
+};
+
+td::Result<td::BufferSlice> serialize_payload(const tl_object_ptr<tl::payload>& payload,
+                                               const CandidateRoots* roots = nullptr);
+td::Result<DeserializedPayload> deserialize_payload(td::Slice data, int max_decompressed_data_size);
 
 }  // namespace ton::validator::consensus

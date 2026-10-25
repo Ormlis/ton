@@ -194,7 +194,7 @@ class CandidateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::acto
     state.store_awaiters.push_back(std::move(promise));
 
     if (state.store_awaiters.size() == 1) {
-      auto result = co_await store_candidate(request->candidate->id, state).wrap();
+      auto result = co_await store_candidate(request->candidate->id, state, std::move(request->roots)).wrap();
 
       for (auto &p : state.store_awaiters) {
         p.set_result(result.clone());
@@ -377,7 +377,8 @@ class CandidateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::acto
     co_return {};
   }
 
-  td::actor::Task<> store_candidate(CandidateId id, CandidateState &state) {
+  td::actor::Task<> store_candidate(CandidateId id, CandidateState &state,
+                                     std::shared_ptr<const CandidateRoots> roots) {
     auto &bus = *owning_bus();
 
     auto candidate = state.candidate_and_cert.candidate;
@@ -388,7 +389,9 @@ class CandidateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::acto
     }
 
     auto contents_key = create_serialize_tl_object<tl::db_key_candidate>(id.to_tl());
-    co_await bus.db->set(std::move(contents_key), (*candidate)->serialize());
+    auto data = (*candidate)->serialize(roots.get());
+    roots.reset();
+    co_await bus.db->set(std::move(contents_key), std::move(data));
 
     auto index_key = create_serialize_tl_object<tl::db_key_candidateResolver_candidateInfo>(id.to_tl());
     co_await bus.db->set(std::move(index_key), td::BufferSlice());

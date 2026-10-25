@@ -6,11 +6,13 @@
 
 #pragma once
 
+#include <memory>
 #include <variant>
 
 #include "adnl/adnl-node-id.hpp"
 #include "keys/keys.hpp"
 #include "ton/ton-types.h"
+#include "validator/candidate-roots.h"
 
 namespace ton::validator::consensus {
 
@@ -172,13 +174,15 @@ struct Delegation {
   td::BufferSlice signature;
 };
 
+struct DeserializedCandidate;
+
 struct Candidate : td::CntObject {
   using Signer = std::variant<PeerValidatorId, Delegation>;
 
   static td::Result<td::Ref<Candidate>> deserialize(td::Slice data, const Bus& bus,
                                                     std::optional<td::uint32> expected_slot = std::nullopt);
-  static td::Result<td::Ref<Candidate>> deserialize_from_broadcast(td::Slice data, Signer signer, const Bus& bus,
-                                                                   td::uint32 expected_slot);
+  static td::Result<DeserializedCandidate> deserialize_from_broadcast(td::Slice data, Signer signer, const Bus& bus,
+                                                                      td::uint32 expected_slot);
 
   Candidate(CandidateId id, ParentId parent_id, PeerValidatorId leader, std::variant<BlockIdExt, BlockCandidate> block,
             td::BufferSlice signature, std::optional<Delegation> delegation = std::nullopt)
@@ -193,18 +197,18 @@ struct Candidate : td::CntObject {
 
   BlockIdExt block_id() const;
   CandidateHashData hash_data() const;
-  td::BufferSlice serialize() const;
-  td::BufferSlice serialize_for_broadcast() const;
+  td::BufferSlice serialize(const CandidateRoots* roots = nullptr) const;
+  td::BufferSlice serialize_for_broadcast(const CandidateRoots* roots = nullptr) const;
   bool is_empty() const;
   adnl::AdnlNodeIdShort collated_by(const Bus& bus) const;
 
  private:
-  static td::Result<td::Ref<Candidate>> deserialize_data(tl::CandidateDataRef data,
-                                                         std::optional<Delegation> delegation, const Bus& bus,
-                                                         std::optional<PeerValidatorId> src,
-                                                         std::optional<td::uint32> expected_slot);
+  static td::Result<DeserializedCandidate> deserialize_data(tl::CandidateDataRef data,
+                                                            std::optional<Delegation> delegation, const Bus& bus,
+                                                            std::optional<PeerValidatorId> src,
+                                                            std::optional<td::uint32> expected_slot);
 
-  tl::CandidateDataRef to_data_tl() const;
+  tl::CandidateDataRef to_data_tl(const CandidateRoots* roots) const;
 
  public:
   CandidateId id;
@@ -216,6 +220,11 @@ struct Candidate : td::CntObject {
 };
 
 using CandidateRef = td::Ref<Candidate>;
+
+struct DeserializedCandidate {
+  CandidateRef candidate;
+  std::shared_ptr<const CandidateRoots> roots;
+};
 
 class CollatorSchedule : public td::CntObject {
  public:

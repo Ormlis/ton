@@ -224,7 +224,7 @@ class ConsensusImpl : public td::actor::SpawnsWith<Bus>, public td::actor::Conne
     if (candidate->collated_by(*owning_bus()) != owning_bus()->local_adnl_id) {
       owning_bus().publish<TraceEvent>(stats::CandidateReceived::create(candidate, false));
     }
-    try_notarize(*slot).start().detach();
+    try_notarize(*slot, event->roots).start().detach();
   }
 
  private:
@@ -245,9 +245,9 @@ class ConsensusImpl : public td::actor::SpawnsWith<Bus>, public td::actor::Conne
     co_return {};
   }
 
-  td::actor::Task<> try_notarize(State::SlotRef slot) {
+  td::actor::Task<> try_notarize(State::SlotRef slot, std::shared_ptr<const CandidateRoots> roots) {
     const auto& candidate = *slot.state->pending_block;
-    auto store_candidate = owning_bus().publish<StoreCandidate>(candidate).start();
+    auto store_candidate = owning_bus().publish<StoreCandidate>(candidate, roots).start();
 
     std::vector<td::actor::Task<ChainStateData>> tasks;
     tasks.push_back(wait_for_parent_normal(candidate));
@@ -267,7 +267,7 @@ class ConsensusImpl : public td::actor::SpawnsWith<Bus>, public td::actor::Conne
     }
 
     auto validation_result = co_await owning_bus().publish<ValidationRequest>(
-        candidate, parent.prev_block_ids, parent.prev_state_roots, parent.is_prev_normal_tip);
+        candidate, parent.prev_block_ids, parent.prev_state_roots, parent.is_prev_normal_tip, std::move(roots));
 
     if (validation_result.has<CandidateReject>()) {
       LOG(WARNING) << "Candidate " << candidate->id

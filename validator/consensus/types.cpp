@@ -9,7 +9,6 @@
 #include "td/utils/overloaded.h"
 
 #include "bus.h"
-#include "checksum.h"
 #include "payload.h"
 
 namespace ton::validator::consensus {
@@ -138,15 +137,17 @@ tl::DelegationRef Delegation::to_tl() const {
 td::Result<CandidateRef> Candidate::deserialize(td::Slice data, const Bus& bus,
                                                 std::optional<td::uint32> expected_slot) {
   if (auto maybe_broadcast = fetch_tl_object<tl::CandidateData>(data, true); maybe_broadcast.is_ok()) {
-    return deserialize_data(maybe_broadcast.move_as_ok(), std::nullopt, bus, std::nullopt, expected_slot);
+    TRY_RESULT(decoded, deserialize_data(maybe_broadcast.move_as_ok(), std::nullopt, bus, std::nullopt, expected_slot));
+    return std::move(decoded.candidate);
   }
   TRY_RESULT(wrapper, fetch_tl_object<tl::candidate>(data, true));
-  return deserialize_data(std::move(wrapper->data_), Delegation::from_tl(std::move(wrapper->delegation_)), bus,
-                          std::nullopt, expected_slot);
+  TRY_RESULT(decoded, deserialize_data(std::move(wrapper->data_), Delegation::from_tl(std::move(wrapper->delegation_)),
+                                       bus, std::nullopt, expected_slot));
+  return std::move(decoded.candidate);
 }
 
-td::Result<CandidateRef> Candidate::deserialize_from_broadcast(td::Slice data, Signer signer, const Bus& bus,
-                                                               td::uint32 expected_slot) {
+td::Result<DeserializedCandidate> Candidate::deserialize_from_broadcast(td::Slice data, Signer signer, const Bus& bus,
+                                                                        td::uint32 expected_slot) {
   TRY_RESULT(broadcast, fetch_tl_object<tl::CandidateData>(data, true));
   auto validator_fn = [&](PeerValidatorId validator) {
     return deserialize_data(std::move(broadcast), std::nullopt, bus, validator, expected_slot);
@@ -157,10 +158,10 @@ td::Result<CandidateRef> Candidate::deserialize_from_broadcast(td::Slice data, S
   return std::visit(td::overloaded(validator_fn, delegation_fn), std::move(signer));
 }
 
-td::Result<CandidateRef> Candidate::deserialize_data(tl::CandidateDataRef broadcast,
-                                                     std::optional<Delegation> delegation, const Bus& bus,
-                                                     std::optional<PeerValidatorId> src,
-                                                     std::optional<td::uint32> expected_slot) {
+td::Result<DeserializedCandidate> Candidate::deserialize_data(tl::CandidateDataRef broadcast,
+                                                              std::optional<Delegation> delegation, const Bus& bus,
+                                                              std::optional<PeerValidatorId> src,
+                                                              std::optional<td::uint32> expected_slot) {
   struct ExtractedData {
     td::uint32 slot;
     ParentId parent_id;
@@ -169,6 +170,7 @@ td::Result<CandidateRef> Candidate::deserialize_data(tl::CandidateDataRef broadc
     CandidateHashData hash_builder;
   };
   td::Result<ExtractedData> maybe_data;
+  std::shared_ptr<const CandidateRoots> roots;
 
   PeerValidator leader;
   auto set_check_leader = [&](td::uint32 slot) -> td::Status {
@@ -201,8 +203,9 @@ td::Result<CandidateRef> Candidate::deserialize_data(tl::CandidateDataRef broadc
     auto slot = static_cast<td::uint32>(block_broadcast.slot_);
     TRY_STATUS(set_check_leader(slot));
 
-    TRY_RESULT(candidate, deserialize_payload(block_broadcast.candidate_,
-                                              bus.config.max_block_size + bus.config.max_collated_data_size + 1024));
+    TRY_RESULT(decoded, deserialize_payload(block_broadcast.candidate_,
+                                            bus.config.max_block_size + bus.config.max_collated_data_size + 1024));
+    auto& candidate = decoded.payload;
 
     if (!candidate->src_.is_zero()) {
       return td::Status::Error("src field of the candidate broadcast must be null");
@@ -217,10 +220,10 @@ td::Result<CandidateRef> Candidate::deserialize_data(tl::CandidateDataRef broadc
     BlockIdExt block_id{
         BlockId{bus.shard, static_cast<BlockSeqno>(candidate->round_)},
         candidate->root_hash_,
-        td::sha256_bits256(candidate->data_.as_slice()),
+        decoded.roots->block_file_hash,
     };
 
-    auto collated_file_hash = td::sha256_bits256(candidate->collated_data_.as_slice());
+    auto collated_file_hash = decoded.roots->collated_file_hash;
 
     Ed25519_PublicKey creator{leader.key.ed25519_value().raw()};
 
@@ -230,6 +233,7 @@ td::Result<CandidateRef> Candidate::deserialize_data(tl::CandidateDataRef broadc
 
     auto parent = CandidateId::tl_to_parent_id(block_broadcast.parent_);
     auto hash_builder = CandidateHashData::create_full(block, parent);
+    roots = std::move(decoded.roots);
     return ExtractedData{
         .slot = slot,
         .parent_id = parent,
@@ -255,8 +259,11 @@ td::Result<CandidateRef> Candidate::deserialize_data(tl::CandidateDataRef broadc
     return td::Status::Error("Candidate broadcast signature is not valid");
   }
 
-  return td::make_ref<Candidate>(id, parsed.parent_id, leader.idx, std::move(parsed.block), std::move(parsed.signature),
-                                 std::move(delegation));
+  return DeserializedCandidate{
+      td::make_ref<Candidate>(id, parsed.parent_id, leader.idx, std::move(parsed.block), std::move(parsed.signature),
+                              std::move(delegation)),
+      std::move(roots),
+  };
 }
 
 BlockIdExt Candidate::block_id() const {
@@ -273,7 +280,7 @@ CandidateHashData Candidate::hash_data() const {
   return std::visit(td::overloaded(empty_fn, block_fn), block);
 }
 
-tl::CandidateDataRef Candidate::to_data_tl() const {
+tl::CandidateDataRef Candidate::to_data_tl(const CandidateRoots* roots) const {
   auto empty_fn = [&](const BlockIdExt& referenced_block) -> tl::CandidateDataRef {
     return create_tl_object<tl::empty>(id.slot, parent_id->to_tl(), create_tl_block_id(referenced_block),
                                        signature.clone());
@@ -284,20 +291,20 @@ tl::CandidateDataRef Candidate::to_data_tl() const {
         candidate.collated_data.clone());
 
     return create_tl_object<tl::block>(id.slot, CandidateId::parent_id_to_tl(parent_id),
-                                       serialize_payload(candidate_tl).move_as_ok(), signature.clone());
+                                       serialize_payload(candidate_tl, roots).move_as_ok(), signature.clone());
   };
   return std::visit(td::overloaded(empty_fn, block_fn), block);
 }
 
-td::BufferSlice Candidate::serialize() const {
+td::BufferSlice Candidate::serialize(const CandidateRoots* roots) const {
   if (!delegation.has_value()) {
-    return serialize_for_broadcast();
+    return serialize_for_broadcast(roots);
   }
-  return create_serialize_tl_object<tl::candidate>(1, to_data_tl(), delegation->to_tl());
+  return create_serialize_tl_object<tl::candidate>(1, to_data_tl(roots), delegation->to_tl());
 }
 
-td::BufferSlice Candidate::serialize_for_broadcast() const {
-  return serialize_tl_object(to_data_tl(), true);
+td::BufferSlice Candidate::serialize_for_broadcast(const CandidateRoots* roots) const {
+  return serialize_tl_object(to_data_tl(roots), true);
 }
 
 bool Candidate::is_empty() const {

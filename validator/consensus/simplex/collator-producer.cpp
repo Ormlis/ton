@@ -77,7 +77,7 @@ class CollatorProducerImpl : public td::actor::SpawnsWith<Bus>, public td::actor
 
   template <>
   void handle(BusHandle bus, std::shared_ptr<const CandidateGenerated> event) {
-    bus.publish<StoreCandidate>(event->candidate).start().detach();
+    bus.publish<StoreCandidate>(event->candidate, event->roots).start().detach();
   }
 
   template <>
@@ -109,7 +109,7 @@ class CollatorProducerImpl : public td::actor::SpawnsWith<Bus>, public td::actor
     if (candidate->collated_by(*owning_bus()) != owning_bus()->local_adnl_id) {
       owning_bus().publish<TraceEvent>(stats::CandidateReceived::create(candidate, false));
     }
-    owning_bus().publish<StoreCandidate>(candidate).start().detach();
+    owning_bus().publish<StoreCandidate>(candidate, event->roots).start().detach();
   }
 
   template <>

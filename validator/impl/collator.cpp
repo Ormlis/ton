@@ -6320,6 +6320,13 @@ void Collator::return_block_candidate() {
   finalize_stats();
   stats_.status = td::Status::OK();
   td::actor::send_closure(manager, &ValidatorManager::log_collate_query_stats, std::move(stats_));
+  if (params_.candidate_roots) {
+    // Expire UsageCell bindings before consumers can traverse the roots on other threads.
+    virtual_shards_.reset();
+    state_usage_tree_.reset();
+    neighbor_proof_builders_.clear();
+    account_storage_dicts_.clear();
+  }
   main_promise.set_value(GeneratedCandidate{
       .candidate = block_candidate->clone(),
       .collated_at_monotonic = td::Timestamp::now().at(),

@@ -38,6 +38,7 @@ struct Collator::CollatedData {
 
   struct Result {
     td::BufferSlice data;
+    std::vector<Ref<vm::Cell>> roots;
     td::RealCpuTimer::Time proofs_time;
     td::RealCpuTimer::Time serialization_time;
   };
@@ -202,9 +203,10 @@ td::actor::Task<Collator::CollatedData::Result> Collator::CollatedData::finalize
   }
   {
     td::RealCpuTimer timer;
-    result.data = CO_TRY(vm::std_boc_serialize_multi(std::move(data.roots), 2));
+    result.data = CO_TRY(vm::std_boc_serialize_multi(data.roots, 2));
     result.serialization_time = timer.elapsed_both();
   }
+  result.roots = std::move(data.roots);
   co_return result;
 }
 
@@ -253,7 +255,14 @@ td::actor::Task<bool> Collator::create_block_candidate() {
     co_return false;
   }
   td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.create_block_candidate};
-  co_return publish_block_candidate(block.move_as_ok(), std::move(completed.data));
+  if (!publish_block_candidate(block.move_as_ok(), std::move(completed.data))) {
+    co_return false;
+  }
+  if (params_.candidate_roots) {
+    *params_.candidate_roots = CandidateRoots{block_candidate->id.file_hash, block_candidate->collated_file_hash,
+                                              new_block, std::move(completed.roots)};
+  }
+  co_return true;
 }
 
 }  // namespace ton::validator
