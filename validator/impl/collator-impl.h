@@ -392,12 +392,15 @@ class Collator final : public td::actor::Actor, private CollatorBase {
 
   void register_new_msg(block::NewOutMsg msg);
   bool register_new_msgs(block::transaction::Transaction& trans, td::optional<block::MsgMetadata> msg_metadata);
+  struct EnqueueBatch;
   bool process_new_messages(bool& enqueue_only);
+  bool flush_enqueued_messages(EnqueueBatch& batch);
   const char* check_message_deferring(const block::NewOutMsg& msg, const StdSmcAddress& src_addr,
                                      std::map<StdSmcAddress, td::uint32>& sender_generated_messages_count,
                                      bool has_unprocessed_deferred_messages, td::uint64 out_msg_queue_size,
                                      size_t new_msgs_from_dispatch, bool is_special = false);
-  int process_one_new_message(block::NewOutMsg msg, bool enqueue_only = false, Ref<vm::Cell>* is_special = nullptr);
+  int process_one_new_message(block::NewOutMsg msg, bool enqueue_only = false, Ref<vm::Cell>* is_special = nullptr,
+                              EnqueueBatch* batch = nullptr);
   bool process_inbound_internal_messages();
   bool precheck_inbound_message(Ref<vm::CellSlice> msg, ton::LogicalTime lt);
   bool process_inbound_message(Ref<vm::CellSlice> msg, ton::LogicalTime lt, td::ConstBitPtr key, int src_nb_idx);
@@ -408,11 +411,11 @@ class Collator final : public td::actor::Actor, private CollatorBase {
   bool process_deferred_message(Ref<vm::CellSlice> enq_msg, StdSmcAddress src_addr, LogicalTime lt,
                                 td::optional<block::MsgMetadata>& msg_metadata);
   bool enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_remaining, StdSmcAddress src_addr,
-                       bool defer = false);
+                       bool defer = false, EnqueueBatch* batch = nullptr);
   bool enqueue_transit_message(Ref<vm::Cell> msg, Ref<vm::Cell> old_msg_env, ton::AccountIdPrefixFull prev_prefix,
                                ton::AccountIdPrefixFull cur_prefix, ton::AccountIdPrefixFull dest_prefix,
                                td::RefInt256 fwd_fee_remaining, td::optional<block::MsgMetadata> msg_metadata,
-                               td::optional<LogicalTime> emitted_lt, bool from_dispatch_queue);
+                               td::optional<LogicalTime> emitted_lt, bool from_dispatch_queue, EnqueueBatch* batch = nullptr);
   bool delete_out_msg_queue_msg(td::ConstBitPtr key);
   bool insert_in_msg(Ref<vm::Cell> in_msg);
   bool flush_in_msg_descriptors();

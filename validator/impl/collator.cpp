@@ -3443,6 +3443,17 @@ const char* Collator::check_message_deferring(const block::NewOutMsg& msg, const
   return nullptr;
 }
 
+// Only used after execution stops. Routing counters are updated immediately;
+// dictionary updates and their proof estimates are flushed before returning.
+struct Collator::EnqueueBatch {
+  struct DispatchQueue {
+    block::AccountDispatchQueue queue;
+    std::vector<std::pair<td::BitArray<64>, Ref<vm::CellBuilder>>> messages;
+  };
+  std::vector<std::pair<td::BitArray<352>, Ref<vm::CellBuilder>>> out_msgs;
+  std::map<StdSmcAddress, DispatchQueue> dispatch_queues;
+};
+
 /**
  * Processes a message generated in this block or a message from DispatchQueue.
  *
@@ -3456,7 +3467,9 @@ const char* Collator::check_message_deferring(const block::NewOutMsg& msg, const
  *          3 - message was processed, all future messages must be enqueued.
  *          -1 - error occurred.
  */
-int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, Ref<vm::Cell>* is_special) {
+int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, Ref<vm::Cell>* is_special,
+                                      EnqueueBatch* batch) {
+  CHECK(!batch || enqueue_only);
   bool from_dispatch_queue = msg.msg_env_from_dispatch_queue.not_null();
   Ref<vm::CellSlice> src, dest;
   bool enqueue, external;
@@ -3512,7 +3525,9 @@ int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, R
   const char* defer_reason = nullptr;
   if (!from_dispatch_queue) {
     defer_reason = check_message_deferring(msg, src_addr, sender_generated_messages_count_,
-                                           unprocessed_deferred_messages_.count(src_addr), out_msg_queue_size_,
+                                           unprocessed_deferred_messages_.count(src_addr) ||
+                                               (batch && batch->dispatch_queues.contains(src_addr)),
+                                           out_msg_queue_size_,
                                            new_msgs_from_dispatch, is_special != nullptr);
   } else {
     auto& x = unprocessed_deferred_messages_[src_addr];
@@ -3533,13 +3548,13 @@ int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, R
       auto dest_prefix = block::tlb::MsgAddressInt::get_prefix(dest);
       FAIL_UNLESS_ERRCODE(env.emitted_lt && env.emitted_lt.value() == msg.lt, -1);
       ok = enqueue_transit_message(std::move(msg.msg), std::move(msg_env), src_prefix, src_prefix, dest_prefix,
-                                   std::move(env.fwd_fee_remaining), std::move(env.metadata), msg.lt, true);
+                                   std::move(env.fwd_fee_remaining), std::move(env.metadata), msg.lt, true, batch);
     } else {
       if (defer) {
         LOG(INFO) << "deferring new message from account " << workchain() << ":" << src_addr.to_hex()
                   << ", lt=" << msg.lt << defer_reason;
       }
-      ok = enqueue_message(std::move(msg), std::move(fwd_fees), src_addr, defer);
+      ok = enqueue_message(std::move(msg), std::move(fwd_fees), src_addr, defer, batch);
     }
     return ok ? 0 : -1;
   }
@@ -3641,7 +3656,7 @@ bool Collator::enqueue_transit_message(Ref<vm::Cell> msg, Ref<vm::Cell> old_msg_
                                        ton::AccountIdPrefixFull prev_prefix, ton::AccountIdPrefixFull cur_prefix,
                                        ton::AccountIdPrefixFull dest_prefix, td::RefInt256 fwd_fee_remaining,
                                        td::optional<block::MsgMetadata> msg_metadata,
-                                       td::optional<LogicalTime> emitted_lt, bool from_dispatch_queue) {
+                                       td::optional<LogicalTime> emitted_lt, bool from_dispatch_queue, EnqueueBatch* batch) {
   if (from_dispatch_queue) {
     FAIL_UNLESS(emitted_lt);
     LOG(DEBUG) << "enqueueing message from dispatch queue " << msg->get_hash().bits().to_hex(256)
@@ -3721,7 +3736,12 @@ bool Collator::enqueue_transit_message(Ref<vm::Cell> msg, Ref<vm::Cell> old_msg_
   bool ok;
   try {
     LOG(DEBUG) << "inserting into outbound queue message with (lt,key)=(" << start_lt << "," << key.to_hex() << ")";
-    ok = out_msg_queue_->set_builder(key.bits(), 352, cb, vm::Dictionary::SetMode::Add);
+    if (batch) {
+      batch->out_msgs.emplace_back(key, Ref<vm::CellBuilder>{cb});
+      ok = true;
+    } else {
+      ok = out_msg_queue_->set_builder(key.bits(), 352, cb, vm::Dictionary::SetMode::Add);
+    }
     ++out_msg_queue_size_;
   } catch (vm::VmError&) {
     ok = false;
@@ -3730,7 +3750,7 @@ bool Collator::enqueue_transit_message(Ref<vm::Cell> msg, Ref<vm::Cell> old_msg_
     LOG(ERROR) << "cannot add an OutMsg into OutMsgQueue dictionary!";
     return false;
   }
-  return register_out_msg_queue_op();
+  return batch || register_out_msg_queue_op();
 }
 
 /**
@@ -4679,7 +4699,7 @@ bool Collator::flush_out_msg_descriptors() {
  * @returns True if the message was successfully enqueued, false otherwise.
  */
 bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_remaining, StdSmcAddress src_addr,
-                               bool defer) {
+                               bool defer, EnqueueBatch* batch) {
   LogicalTime enqueued_lt = msg.lt;
   FAIL_UNLESS(msg.msg_env_from_dispatch_queue.is_null());
   // 0. unpack src_addr and dest_addr
@@ -4735,13 +4755,17 @@ bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_rema
 
   // 6. insert EnqueuedMsg into OutMsgQueue (or DispatchQueue)
   if (defer) {
-    block::AccountDispatchQueue account_queue;
-    if (!account_queue.unpack(dispatch_queue_->lookup(src_addr))) {
+    auto* pending = batch ? &batch->dispatch_queues[src_addr] : nullptr;
+    block::AccountDispatchQueue local_queue;
+    auto& account_queue = pending ? pending->queue : local_queue;
+    if ((!pending || pending->messages.empty()) && !account_queue.unpack(dispatch_queue_->lookup(src_addr))) {
       return fatal_error(PSTRING() << "cannot unpack AccountDispatchQueue for account " << src_addr.to_hex());
     }
     td::BitArray<64> key;
     key.store_ulong(msg.lt);
-    if (!account_queue.dict.set_builder(key, cb, vm::Dictionary::SetMode::Add)) {
+    if (pending) {
+      pending->messages.emplace_back(key, Ref<vm::CellBuilder>{cb});
+    } else if (!account_queue.dict.set_builder(key, cb, vm::Dictionary::SetMode::Add)) {
       return fatal_error(PSTRING() << "cannot add message to AccountDispatchQueue for account " << src_addr.to_hex()
                                    << ", lt=" << msg.lt);
     }
@@ -4754,6 +4778,9 @@ bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_rema
       }
     } else {
       account_queue.total_balance.invalidate();
+    }
+    if (pending) {
+      return true;
     }
     Ref<vm::CellSlice> account_dict_csr;
     if (!account_queue.pack(account_dict_csr)) {
@@ -4772,7 +4799,12 @@ bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_rema
   try {
     LOG(DEBUG) << "inserting into outbound queue a new message with (lt,key)=(" << start_lt << "," << key.to_hex()
                << ")";
-    ok = out_msg_queue_->set_builder(key.bits(), 352, cb, vm::Dictionary::SetMode::Add);
+    if (batch) {
+      batch->out_msgs.emplace_back(key, Ref<vm::CellBuilder>{cb});
+      ok = true;
+    } else {
+      ok = out_msg_queue_->set_builder(key.bits(), 352, cb, vm::Dictionary::SetMode::Add);
+    }
     ++out_msg_queue_size_;
   } catch (vm::VmError&) {
     ok = false;
@@ -4781,7 +4813,47 @@ bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_rema
     LOG(ERROR) << "cannot add an OutMsg into OutMsgQueue dictionary!";
     return false;
   }
-  return register_out_msg_queue_op();
+  return batch || register_out_msg_queue_op();
+}
+
+bool Collator::flush_enqueued_messages(EnqueueBatch& batch) {
+  try {
+    std::vector<std::pair<td::ConstBitPtr, Ref<vm::CellBuilder>>> updates;
+    if (!batch.out_msgs.empty()) {
+      updates.reserve(batch.out_msgs.size());
+      for (const auto& [key, value] : batch.out_msgs) {
+        updates.emplace_back(key.bits(), value);
+      }
+      FAIL_UNLESS(out_msg_queue_->multiset(updates, vm::Dictionary::SetMode::Add));
+      out_msg_queue_ops_ += batch.out_msgs.size();
+      FAIL_UNLESS(block_limit_status_->add_proof(out_msg_queue_->get_root_cell()));
+    }
+    std::vector<std::pair<td::ConstBitPtr, Ref<vm::CellBuilder>>> dispatch_updates;
+    dispatch_updates.reserve(batch.dispatch_queues.size());
+    for (auto& [address, pending] : batch.dispatch_queues) {
+      if (!check_cancelled()) {
+        return false;
+      }
+      updates.clear();
+      for (const auto& [key, value] : pending.messages) {
+        updates.emplace_back(key.bits(), value);
+      }
+      FAIL_UNLESS(pending.queue.dict.multiset(updates, vm::Dictionary::SetMode::Add));
+      Ref<vm::CellSlice> account_queue;
+      FAIL_UNLESS(pending.queue.pack(account_queue));
+      auto value = td::make_ref<vm::CellBuilder>();
+      FAIL_UNLESS(value.write().append_cellslice_bool(account_queue));
+      dispatch_updates.emplace_back(address.bits(), std::move(value));
+      dispatch_queue_ops_ += pending.messages.size();
+    }
+    if (!dispatch_updates.empty()) {
+      FAIL_UNLESS(dispatch_queue_->multiset(dispatch_updates));
+      FAIL_UNLESS(block_limit_status_->add_proof(dispatch_queue_->get_root_cell()));
+    }
+  } catch (vm::VmError& error) {
+    return fatal_error(PSTRING() << "cannot apply outbound message queue batch: " << error.get_msg());
+  }
+  return true;
 }
 
 /**
@@ -4795,6 +4867,7 @@ bool Collator::process_new_messages(bool& enqueue_only) {
   SCOPE_EXIT {
     stats_.load_fraction_new_msgs = block_limit_status_->load_fraction(block::ParamLimits::cl_normal);
   };
+  std::optional<EnqueueBatch> batch;
   while (!new_msgs.empty()) {
     if (virtual_shards_ ? virtual_shard_budget_exhausted(block::ParamLimits::cl_normal)
                         : !block_limit_status_->fits(block::ParamLimits::cl_normal)) {
@@ -4820,7 +4893,10 @@ bool Collator::process_new_messages(bool& enqueue_only) {
       return false;
     }
     LOG(DEBUG) << "have message with lt=" << msg.lt;
-    int res = process_one_new_message(std::move(msg), enqueue_only);
+    if (enqueue_only && !batch && !new_msgs.empty()) {
+      batch.emplace();
+    }
+    int res = process_one_new_message(std::move(msg), enqueue_only, nullptr, batch ? &*batch : nullptr);
     if (res < 0) {
       return fatal_error("error processing newly-generated outbound messages");
     } else if (res == 3) {
@@ -4829,6 +4905,13 @@ bool Collator::process_new_messages(bool& enqueue_only) {
       stats_.limits_log += PSTRING() << "NEW_MESSAGES: "
                                      << block_full_comment(*block_limit_status_, block::ParamLimits::cl_normal) << "\n";
     }
+  }
+  if (batch) {
+    if (!flush_enqueued_messages(*batch)) {
+      return fatal_error("cannot apply outbound message queue batch");
+    }
+    block_full_ |= virtual_shards_ ? virtual_shard_budget_exhausted(block::ParamLimits::cl_normal)
+                                  : !block_limit_status_->fits(block::ParamLimits::cl_normal);
   }
   return true;
 }
