@@ -17,12 +17,19 @@ td::Status ShardGroupMessageOrder::add_parent(Ref<vm::Cell> state, ShardIdFull g
     if (!tlb::unpack_cell(std::move(state), shard) || !tlb::unpack_cell(shard.out_msg_queue_info, qinfo)) {
       return td::Status::Error("Invalid shard group parent queues");
     }
+    ShardIdFull owner;
+    if (!block::tlb::t_ShardIdent.unpack(shard.shard_id.write(), owner)) {
+      return td::Status::Error("Invalid parent shard identifier");
+    }
+    auto processed = block::MsgProcessedUptoCollection::unpack(owner, std::move(qinfo.proc_info));
+    if (!processed) {
+      return td::Status::Error("Invalid parent processed frontier");
+    }
+    parent_processed_.push_back(std::move(*processed));
     if (qinfo.extra.write().fetch_long(1)) {
       block::gen::OutMsgQueueData::Record data;
       Ref<vm::Cell> root;
-      ShardIdFull owner;
-      if (!block::unpack_queue_extra(*qinfo.extra, data, &root) ||
-          !block::tlb::t_ShardIdent.unpack(shard.shard_id.write(), owner)) {
+      if (!block::unpack_queue_extra(*qinfo.extra, data, &root)) {
         return td::Status::Error("Invalid parent shard group queue data");
       }
       if (root.not_null()) {
@@ -48,6 +55,28 @@ td::Status ShardGroupMessageOrder::add_parent(Ref<vm::Cell> state, ShardIdFull g
   return td::Status::OK();
 }
 
+std::set<BlockSeqno> ShardGroupMessageOrder::referenced_masterchain_states() const {
+  std::set<BlockSeqno> result;
+  if (!parent_queues_.empty()) {
+    for (const auto& frontier : parent_processed_) {
+      for (const auto& entry : frontier.list) {
+        result.insert(entry.mc_seqno);
+      }
+    }
+  }
+  return result;
+}
+
+void ShardGroupMessageOrder::set_shard_end_lt(BlockSeqno seqno, const block::compute_shard_end_lt_func_t& end_lt) {
+  for (auto& frontier : parent_processed_) {
+    for (auto& entry : frontier.list) {
+      if (entry.mc_seqno == seqno) {
+        entry.compute_shard_end_lt = end_lt;
+      }
+    }
+  }
+}
+
 // Keep unresolved older transfers in route order. Receipts in the same parent cut already prove execution.
 bool ShardGroupMessageOrder::scan(vm::AugmentedDictionary& queue, size_t& budget) {
   return queue.check_for_each_extra([&](Ref<vm::CellSlice> value, Ref<vm::CellSlice>, td::ConstBitPtr key, int) {
@@ -65,6 +94,12 @@ bool ShardGroupMessageOrder::scan(vm::AugmentedDictionary& queue, size_t& budget
     block::EnqueuedMsgDescr msg;
     if (!msg.unpack(value.write())) {
       return false;
+    }
+    for (const auto& frontier : parent_processed_) {
+      if (shard_contains(frontier.owner, msg.dest_prefix_) && frontier.can_check_processed() &&
+          frontier.already_processed(msg)) {
+        return true;
+      }
     }
     times_[{msg.src_prefix_, msg.dest_prefix_}].first_queued = 0;
     return true;

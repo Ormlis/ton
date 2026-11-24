@@ -39,6 +39,8 @@ class ShardGroupMessageOrder {
  public:
   using Route = std::pair<AccountIdPrefixFull, AccountIdPrefixFull>;
   td::Status add_parent(Ref<vm::Cell> state, ShardIdFull group);
+  std::set<BlockSeqno> referenced_masterchain_states() const;
+  void set_shard_end_lt(BlockSeqno seqno, const block::compute_shard_end_lt_func_t& end_lt);
   void index_parents();
   bool can_deliver(const Route& route, LogicalTime lt);
   bool record(const Route& route, LogicalTime lt, bool direct);
@@ -51,6 +53,7 @@ class ShardGroupMessageOrder {
   std::map<Route, Times> times_;
   std::vector<Ref<vm::Cell>> parent_queues_;
   std::map<ShardIdFull, vm::Dictionary> parent_receipts_;
+  std::vector<block::MsgProcessedUptoCollection> parent_processed_;
   std::map<AccountIdPrefixFull, bool> indexed_hops_;
   bool scan(vm::AugmentedDictionary& queue, size_t& budget);
   bool index_hop(AccountIdPrefixFull hop);

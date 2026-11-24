@@ -52,8 +52,8 @@ td::actor::Task<GeneratedRoundRef> collate_round(BusHandle bus, ChainStateRef st
   const auto& members = bus->group_members;
   if (!members.empty()) {
     common.group_members = members;
-    common.group_message_order = CO_TRY(state->group_message_order());
     common.group_mc_state = co_await td::actor::ask(bus->manager, &ManagerFacade::group_masterchain_state);
+    common.group_message_order = co_await state->group_message_order(bus->manager, common.group_mc_state);
     auto min_utime = common.group_mc_state->get_unix_time();
     for (size_t i = 0; i < members.size(); ++i) {
       block::gen::ShardStateUnsplit::Record prev;

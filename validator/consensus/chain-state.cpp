@@ -122,7 +122,8 @@ BlockIdExt ChainState::min_mc_block_id() const {
   return min_mc_block_id_;
 }
 
-td::Result<std::shared_ptr<const ShardGroupMessageOrder>> ChainState::group_message_order() const {
+td::actor::Task<std::shared_ptr<const ShardGroupMessageOrder>> ChainState::group_message_order(
+    td::actor::ActorId<ManagerFacade> manager, td::Ref<MasterchainState> head) const {
   CHECK(!members_.empty());
   auto group = members_.front()->block_ids().front().shard_full();
   for (size_t n = members_.size(); n > 1; n /= 2) {
@@ -130,16 +131,42 @@ td::Result<std::shared_ptr<const ShardGroupMessageOrder>> ChainState::group_mess
   }
   auto order = std::make_shared<ShardGroupMessageOrder>();
   for (const auto& member : members_) {
-    TRY_STATUS(order->add_parent(member->root_, group));
+    CO_TRY(order->add_parent(member->root_, group));
+  }
+  // Resolve only the snapshots named by the authenticated parent frontiers. Using the newest shard end_lt
+  // here would allow a newer processed cursor to skip a message that its snapshot could not yet see.
+  auto seqnos = order->referenced_masterchain_states();
+  if (!seqnos.empty() && head.is_null()) {
+    head = co_await td::actor::ask(manager, &ManagerFacade::group_masterchain_state);
+  }
+  std::map<BlockSeqno, td::actor::StartedTask<td::Ref<vm::Cell>>> requests;
+  for (auto seqno : seqnos) {
+    if (seqno != head->get_seqno()) {
+      BlockIdExt id;
+      if (!head->get_old_mc_block_id(seqno, id)) {
+        co_return td::Status::Error(ErrorCode::notready,
+                                    "Shard group parent references an unavailable masterchain state");
+      }
+      requests.emplace(seqno,
+                       td::actor::ask(manager, &ManagerFacade::wait_block_state_root, id, td::Timestamp::in(10)));
+    }
   }
   try {
+    for (auto seqno : seqnos) {
+      auto root = seqno == head->get_seqno() ? head->root_cell() : co_await std::move(requests.at(seqno));
+      auto shards = block::ShardConfig::extract_shard_hashes_dict(root);
+      if (!shards) {
+        co_return td::Status::Error("Invalid shard layout for a processed frontier");
+      }
+      order->set_shard_end_lt(seqno, block::ShardConfig(shards->get_root_cell()).get_compute_shard_end_lt_func());
+    }
     order->index_parents();
   } catch (const vm::VmError& e) {
-    return e.as_status();
+    co_return e.as_status();
   } catch (const vm::VmVirtError& e) {
-    return e.as_status();
+    co_return e.as_status();
   }
-  return std::shared_ptr<const ShardGroupMessageOrder>(std::move(order));
+  co_return std::shared_ptr<const ShardGroupMessageOrder>(std::move(order));
 }
 
 BlockSeqno ChainState::next_seqno() const {

@@ -103,7 +103,7 @@ class BlockValidatorImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
           co_return CandidateReject{view.move_as_error().to_string(), {}};
         }
         messages = view.move_as_ok();
-        order = CO_TRY(event->state->group_message_order());
+        order = co_await event->state->group_message_order(bus.manager);
         std::optional<double> timestamp;
         for (const auto& block : blocks) {
           auto t = get_candidate_gen_utime_exact(block);

@@ -131,7 +131,8 @@ class ChainState : public td::CntObject {
   std::vector<td::Ref<BlockData>> block_data() const;
   std::vector<td::Ref<vm::Cell>> state() const;
   BlockIdExt min_mc_block_id() const;
-  td::Result<std::shared_ptr<const ShardGroupMessageOrder>> group_message_order() const;
+  td::actor::Task<std::shared_ptr<const ShardGroupMessageOrder>> group_message_order(
+      td::actor::ActorId<ManagerFacade> manager, td::Ref<MasterchainState> head = {}) const;
 
   BlockSeqno next_seqno() const;
   bool is_before_split() const;
