@@ -35,9 +35,8 @@ class ShardGroupExchange final : public td::actor::Actor {
       : size_(size), external_deadline_(external_deadline) {
   }
   void external_queue_ready(ShardIdFull member, bool closed);
-  void publish(Transfers outgoing);
-  void exchange(ShardIdFull member, Transfers outgoing, bool accept_transfers, Externals externals,
-                td::Promise<Work> promise);
+  void offer(Transfer transfer);
+  void wait_for_work(ShardIdFull member, bool accept_transfers, Externals externals, td::Promise<Work> promise);
   void cancel();
 
  private:

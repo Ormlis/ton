@@ -70,8 +70,11 @@ TEST(ShardGroups, LateExternalWakesAnIdleGroup) {
     td::actor::BackpressureQueue<int> inputs("externals", 1, [id = exchange.get(), sender](bool closed) {
       td::actor::send_closure(id, &Exchange::external_queue_ready, sender, closed);
     });
-    auto next = [&](ShardIdFull shard, Externals ext, Exchange::Transfers outgoing = {}) {
-      return td::actor::ask(exchange, &Exchange::exchange, shard, std::move(outgoing), true, ext);
+    auto next = [&](ShardIdFull shard, Externals ext) {
+      return td::actor::ask(exchange, &Exchange::wait_for_work, shard, true, ext);
+    };
+    auto offer = [&](LogicalTime lt) {
+      td::actor::send_closure_later(exchange, &Exchange::offer, Exchange::Transfer{receiver, lt, {}});
     };
     auto a = next(sender, Externals::wait), b = next(receiver, Externals::done);
     co_await scheduler.wait_sync_work();
@@ -79,8 +82,15 @@ TEST(ShardGroups, LateExternalWakesAnIdleGroup) {
     ASSERT_TRUE(co_await inputs.push(42));
     ASSERT_TRUE((co_await std::move(a)).read_externals);
     ASSERT_EQ(42, co_await inputs.try_pop());
-    a = next(sender, Externals::wait, {{receiver, 123, {}}});
+    offer(123);
     ASSERT_EQ(123u, (co_await std::move(b)).transfers.at(0).lt);
+    offer(124);
+    offer(125);
+    auto pending = co_await next(receiver, Externals::done);
+    ASSERT_EQ(2u, pending.transfers.size());
+    ASSERT_EQ(124u, pending.transfers[0].lt);
+    ASSERT_EQ(125u, pending.transfers[1].lt);
+    a = next(sender, Externals::wait);
     b = next(receiver, Externals::done);
     co_await scheduler.wait_sync_work();
     ASSERT_TRUE(!a.await_ready() && !b.await_ready());

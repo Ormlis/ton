@@ -180,18 +180,19 @@ void ShardGroupExchange::external_queue_ready(ShardIdFull member, bool closed) {
   }
 }
 
-void ShardGroupExchange::publish(Transfers outgoing) {
-  for (auto& transfer : outgoing) {
-    auto& destination = members_[transfer.destination];
-    if (destination.accept_transfers && !destination.finished) {
-      destination.inbox.push_back(std::move(transfer));
-    }
+void ShardGroupExchange::offer(Transfer transfer) {
+  auto& destination = members_[transfer.destination];
+  if (destination.finished || !destination.accept_transfers) {
+    return;
   }
-  dispatch();
+  destination.inbox.push_back(std::move(transfer));
+  if (destination.waiter) {
+    dispatch();
+  }
 }
 
-void ShardGroupExchange::exchange(ShardIdFull member, Transfers outgoing, bool accept_transfers, Externals externals,
-                                  td::Promise<Work> promise) {
+void ShardGroupExchange::wait_for_work(ShardIdFull member, bool accept_transfers, Externals externals,
+                                       td::Promise<Work> promise) {
   auto& state = members_[member];
   state.waiter = std::move(promise);
   state.externals = externals;
@@ -199,7 +200,7 @@ void ShardGroupExchange::exchange(ShardIdFull member, Transfers outgoing, bool a
   if (!accept_transfers) {
     state.inbox.clear();
   }
-  publish(std::move(outgoing));
+  dispatch();
 }
 
 void ShardGroupExchange::dispatch() {

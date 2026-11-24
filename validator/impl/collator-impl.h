@@ -208,7 +208,6 @@ class Collator final : public td::actor::Actor {
   td::CancellationTokenSource ext_msg_cancellation_;
 
   std::priority_queue<NewOutMsg, std::vector<NewOutMsg>, std::greater<NewOutMsg>> new_msgs;
-  ShardGroupExchange::Transfers group_exports_;
   std::map<AccountIdPrefixFull, LogicalTime> group_last_import_lt_;
   ShardGroupMessageOrder group_message_order_;
   td::actor::Task<> process_group_messages();

@@ -77,7 +77,6 @@ static constexpr td::uint32 SPLIT_MAX_QUEUE_SIZE = 100000;
 static constexpr td::uint32 MERGE_MAX_QUEUE_SIZE = 2047;
 static constexpr td::uint32 SKIP_EXTERNALS_QUEUE_SIZE = 8000;
 static constexpr int HIGH_PRIORITY_EXTERNAL = 10;  // don't skip high priority externals when queue is big
-static constexpr size_t SHARD_GROUP_BATCH_SIZE = 32;
 
 /**
  * Constructs a Collator object.
@@ -3026,34 +3025,32 @@ td::Result<block::Account*> Collator::make_account(td::ConstBitPtr addr, bool fo
 }
 
 /**
- * Removes UsageCell's from new_root's subtree, replacing them with regular DataCell's
+ * Removes usage tracking from a cell tree before sharing it with another actor.
  *
- * @param old_root Original root (not wrapped in UsageCell)
- * @param new_root Cell to remove UsageCell's from
- * @param usage_tree CellUsageTree for old_root
+ * @param new_root Cell tree to detach.
+ * @param previous Optional proof builder whose original subtrees can be reused.
  *
  * @returns new_root without UsageCell's
  */
-static td::Result<td::Ref<vm::Cell>> clean_usage_cells(td::Ref<vm::Cell> old_root, td::Ref<vm::Cell> new_root,
-                                                       const vm::CellUsageTree& usage_tree) {
+static td::Result<td::Ref<vm::Cell>> clean_usage_cells(td::Ref<vm::Cell> new_root,
+                                                       const vm::MerkleProofBuilder* previous = nullptr) {
   if (new_root.is_null()) {
     return td::Ref<vm::Cell>{};
   }
 
   td::HashMap<vm::CellHash, td::Ref<vm::Cell>> visited_cells;
-  std::function<void(td::Ref<vm::Cell>, vm::CellUsageTree::NodeId)> dfs_old = [&](td::Ref<vm::Cell> cell,
-                                                                                  vm::CellUsageTree::NodeId node_id) {
-    visited_cells[cell->get_hash()] = cell;
-    if (!usage_tree.is_loaded(node_id)) {
-      return;
-    }
-    vm::CellSlice cs{vm::NoVm(), cell};
-    for (unsigned i = 0; i < cs.size_refs(); i++) {
-      dfs_old(cs.prefetch_ref(i), usage_tree.get_child(node_id, i));
-    }
-  };
-  if (old_root.not_null()) {
-    dfs_old(old_root, usage_tree.root_id());
+  if (previous && previous->original_root().not_null()) {
+    const auto& usage_tree = previous->get_usage_tree();
+    auto dfs_old = [&](auto&& self, td::Ref<vm::Cell> cell, vm::CellUsageTree::NodeId node_id) -> void {
+      visited_cells[cell->get_hash()] = cell;
+      if (usage_tree.is_loaded(node_id)) {
+        vm::CellSlice cs{vm::NoVm(), cell};
+        for (unsigned i = 0; i < cs.size_refs(); i++) {
+          self(self, cs.prefetch_ref(i), usage_tree.get_child(node_id, i));
+        }
+      }
+    };
+    dfs_old(dfs_old, previous->original_root(), usage_tree.root_id());
   }
 
   std::function<td::Result<td::Ref<vm::Cell>>(td::Ref<vm::Cell>)> dfs =
@@ -3062,7 +3059,7 @@ static td::Result<td::Ref<vm::Cell>> clean_usage_cells(td::Ref<vm::Cell> old_roo
     if (it != visited_cells.end()) {
       return it->second;
     }
-    auto loaded_cell = cell->load_cell().move_as_ok();
+    TRY_RESULT(loaded_cell, cell->load_cell());
     TRY_BOOL(loaded_cell.effective_level >= loaded_cell.data_cell->get_level());
     td::Ref<vm::DataCell> data_cell = std::move(loaded_cell.data_cell);
     td::Ref<vm::Cell> children[vm::Cell::max_refs];
@@ -3075,9 +3072,9 @@ static td::Result<td::Ref<vm::Cell>> clean_usage_cells(td::Ref<vm::Cell> old_roo
       }
     }
     if (changed) {
-      data_cell = vm::DataCell::create(td::Slice{data_cell->get_data(), (data_cell->size() + 7) / 8}, data_cell->size(),
-                                       {children, data_cell->size_refs()}, data_cell->is_special())
-                      .move_as_ok();
+      TRY_RESULT_ASSIGN(data_cell, vm::DataCell::create(td::Slice{data_cell->get_data(), (data_cell->size() + 7) / 8},
+                                                        data_cell->size(), {children, data_cell->size_refs()},
+                                                        data_cell->is_special()));
       TRY_BOOL(data_cell->get_hash() == cell->get_hash());
     }
     return visited_cells[cell->get_hash()] = data_cell;
@@ -3118,7 +3115,7 @@ bool Collator::process_account_storage_dict(block::Account& account) {
   td::Ref<vm::Cell> original_dict_root = dict.mpb.original_root();
   if (store_dict_to_cache) {
     td::Ref<vm::Cell> dict_root = account.account_storage_stat.value().get_dict_root().move_as_ok();
-    auto r_dict_root = clean_usage_cells(original_dict_root, dict_root, dict.mpb.get_usage_tree());
+    auto r_dict_root = clean_usage_cells(std::move(dict_root), &dict.mpb);
     if (r_dict_root.is_error()) {
       return fatal_error(r_dict_root.move_as_error());
     }
@@ -3973,12 +3970,13 @@ td::actor::Task<> Collator::process_group_messages() {
            block_limit_status_->fits(block::ParamLimits::cl_normal) && !internal_msg_timeout_.is_in_past();
   };
   using Externals = ShardGroupExchange::Externals;
-  // Snapshot-only producers close their queue after pushing the initial messages.
-  auto batch_size = params_.wait_externals_until ? SHARD_GROUP_BATCH_SIZE : std::numeric_limits<size_t>::max();
+  // Revisit peer and local messages even when the live external queue stays full.
+  constexpr size_t max_live_externals_per_pass = 32;
+  auto external_limit = params_.wait_externals_until ? max_live_externals_per_pass : std::numeric_limits<size_t>::max();
   bool read_externals = true;
   LogicalTime external_floor = 0;
   while (true) {
-    bool more_externals = read_externals && co_await process_inbound_external_messages(batch_size, external_floor);
+    bool more_externals = read_externals && co_await process_inbound_external_messages(external_limit, external_floor);
     bool enqueue_only = !can_execute();
     if (!process_new_messages(enqueue_only)) {
       co_return td::Status::Error("Cannot process shard group outputs");
@@ -3988,8 +3986,8 @@ td::actor::Task<> Collator::process_group_messages() {
         block_limit_status_->fits(block::ParamLimits::cl_soft) && !external_msg_timeout_.is_in_past()) {
       externals = more_externals ? Externals::ready : Externals::wait;
     }
-    auto work = co_await td::actor::ask(params_.group_exchange, &ShardGroupExchange::exchange, shard_,
-                                        std::exchange(group_exports_, {}), can_execute(), externals);
+    auto work = co_await td::actor::ask(params_.group_exchange, &ShardGroupExchange::wait_for_work, shard_,
+                                        can_execute(), externals);
     auto& inbox = work.transfers;
     read_externals = work.read_externals;
     if (inbox.empty() && !read_externals) {
@@ -5132,20 +5130,21 @@ bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_rema
               && cb.store_ref_bool(msg_env));  // out_msg:^MsgEnvelope = EnqueuedMsg;
 
   // The offer is advisory. The committed export and its queue entry are identical with or without a recipient.
+  std::optional<ShardGroupExchange::Transfer> group_offer;
   if (!params_.group_exchange.empty()) {
     ShardGroupMessageOrder::Route route{src_prefix, dest_prefix};
     for (auto peer : params_.group_members) {
       if (peer != shard_ && shard_contains(peer, dest_prefix)) {
         if (offer_to_group && !defer && shard_contains(peer, next_hop) &&
             group_message_order_.can_deliver(route, msg.lt)) {
-          group_exports_.push_back({peer, msg.lt, msg_env});
-          if (group_exports_.size() == SHARD_GROUP_BATCH_SIZE) {
-            td::actor::send_closure(params_.group_exchange, &ShardGroupExchange::publish,
-                                    std::exchange(group_exports_, {}));
+          // Reading a UsageCell on the receiver would update the sender's proof builder.
+          auto envelope = clean_usage_cells(std::move(msg_env));
+          if (envelope.is_ok()) {
+            group_offer = ShardGroupExchange::Transfer{peer, msg.lt, envelope.move_as_ok()};
+            break;
           }
-        } else {
-          group_message_order_.record(route, msg.lt, false);
         }
+        group_message_order_.record(route, msg.lt, false);
         break;
       }
     }
@@ -5197,7 +5196,14 @@ bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_rema
     LOG(ERROR) << "cannot add an OutMsg into OutMsgQueue dictionary!";
     return false;
   }
-  return register_out_msg_queue_op();
+  if (!register_out_msg_queue_op()) {
+    return false;
+  }
+  if (group_offer) {
+    // The offer and the sender's subsequent wait go to the same actor mailbox in order.
+    td::actor::send_closure_later(params_.group_exchange, &ShardGroupExchange::offer, std::move(*group_offer));
+  }
+  return true;
 }
 
 /**
