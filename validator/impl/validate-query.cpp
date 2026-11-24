@@ -2138,6 +2138,11 @@ bool ValidateQuery::check_one_shard(const block::McShardHash& info, const block:
         return reject_query(PSTRING() << "ShardTopBlockDescr for " << sh_bd->block_id() << " is invalid: res_flags="
                                       << res_flags << " " << chk_res.move_as_error().to_string());
       }
+      for (const auto& member : sh_bd->group_blocks()) {
+        if (!new_shard_conf_->contains(member)) {
+          return reject_query("Masterchain update splits a certified shard group");
+        }
+      }
       int chain_len = chk_res.move_as_ok();
       if (chain_len <= 0 || chain_len > 8) {
         return reject_query(PSTRING() << "ShardTopBlockDescr for " << sh_bd->block_id()

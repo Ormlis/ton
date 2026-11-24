@@ -286,6 +286,14 @@ class ValidatorManagerImpl : public ValidatorManager {
   // DATA FOR COLLATOR
   struct ShardTopBlock {
     td::Ref<ShardTopBlockDescription> latest_desc;
+    std::map<BlockSeqno, td::Ref<ShardTopBlockDescription>> group_rounds;
+    bool already_have(BlockSeqno seqno) const {
+      if (group_rounds.empty()) {
+        return seqno <= latest_desc->block_id().seqno();
+      }
+      auto latest = group_rounds.rbegin()->first;
+      return group_rounds.contains(seqno) || (seqno < latest && latest - seqno >= 8);
+    }
   };
   std::map<ShardTopBlockDescriptionId, ShardTopBlock> shard_blocks_;
   std::set<BlockIdExt> active_shard_block_desc_generation_;

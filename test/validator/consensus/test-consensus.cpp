@@ -445,9 +445,9 @@ class TestManagerFacade : public ManagerFacade {
     co_return CandidateAccept{.ok_from_utime = co_await get_candidate_gen_utime_exact(candidate)};
   }
 
-  td::actor::Task<> accept_block(BlockIdExt id, td::Ref<BlockData> data, size_t creator_idx,
-                                 td::Ref<block::BlockSignatureSet> signatures, int finality_broadcast_mode,
-                                 bool apply) override;
+  td::actor::Task<> accept_blocks(std::vector<td::Ref<BlockData>> blocks, size_t creator_idx,
+                                  td::Ref<block::BlockSignatureSet> signatures, int finality_broadcast_mode,
+                                  bool apply) override;
 
   td::actor::Task<td::Ref<vm::Cell>> wait_block_state_root(BlockIdExt block_id, td::Timestamp timeout) override;
   td::actor::Task<td::Ref<BlockData>> wait_block_data(BlockIdExt block_id, td::Timestamp timeout) override;
@@ -890,13 +890,15 @@ class TestConsensus : public td::actor::Actor {
   bool finishing_ = false;
 };
 
-td::actor::Task<> TestManagerFacade::accept_block(BlockIdExt id, td::Ref<BlockData> data, size_t creator_idx,
-                                                  td::Ref<block::BlockSignatureSet> signatures,
-                                                  int finality_broadcast_mode, bool apply) {
+td::actor::Task<> TestManagerFacade::accept_blocks(std::vector<td::Ref<BlockData>> blocks, size_t creator_idx,
+                                                   td::Ref<block::BlockSignatureSet> signatures,
+                                                   int finality_broadcast_mode, bool apply) {
+  CHECK(blocks.size() == 1);
+  auto data = blocks.front();
+  auto id = data->block_id();
   CHECK(id.shard_full() == SHARD);
   LOG(WARNING) << "Accept block #" << id.seqno() << " (" << (signatures->is_final() ? "final" : "notarize")
                << " signatures), creator_idx=" << creator_idx;
-  CHECK(id == data->block_id());
   td::actor::ask(test_consensus_, &TestConsensus::on_block_accepted, node_idx_, instance_idx_, data, creator_idx,
                  signatures)
       .detach();

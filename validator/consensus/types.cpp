@@ -77,25 +77,25 @@ ParentId CandidateId::tl_to_parent_id(const tl::CandidateParentRef& tl_parent) {
   return id;
 }
 
-CandidateHashData CandidateHashData::from_tl(tl::CandidateHashData&& data) {
-  CandidateHashData builder;
-
-  auto empty_fn = [&](const tl::candidateHashDataEmpty& empty) {
-    builder = CandidateHashData::create_empty(create_block_id(empty.block_), CandidateId::from_tl(empty.parent_));
-  };
-  auto ordinary_fn = [&](const tl::candidateHashDataOrdinary& full) {
-    FullCandidate candidate{create_block_id(full.block_), full.collated_file_hash_};
-    builder = CandidateHashData::create_full(candidate, CandidateId::tl_to_parent_id(full.parent_));
-  };
-  ton_api::downcast_call(data, td::overloaded(empty_fn, ordinary_fn));
-
-  return builder;
+static auto tl_block_ids(const BlockReferences& ids) {
+  std::vector<tl_object_ptr<ton_api::tonNode_blockIdExt>> result;
+  for (const auto& id : ids) {
+    result.push_back(create_tl_block_id(id));
+  }
+  return result;
 }
 
-BlockIdExt CandidateHashData::block() const {
-  auto empty_fn = [&](const EmptyCandidate& empty) { return empty.reference; };
-  auto full_fn = [&](const FullCandidate& full) { return full.id; };
-  return std::visit(td::overloaded(empty_fn, full_fn), candidate);
+CandidateHashData CandidateHashData::from(const CandidateContents& contents, ParentId parent) {
+  CandidateHashData data{{}, {}, parent};
+  if (auto refs = std::get_if<BlockReferences>(&contents)) {
+    data.blocks = *refs;
+  } else {
+    for (const auto& block : std::get<CandidateBlocks>(contents)) {
+      data.blocks.push_back(block.id);
+      data.collated_file_hashes.push_back(block.collated_file_hash);
+    }
+  }
+  return data;
 }
 
 CandidateId CandidateHashData::build_id_with(td::uint32 slot) const {
@@ -103,14 +103,16 @@ CandidateId CandidateHashData::build_id_with(td::uint32 slot) const {
 }
 
 tl::CandidateHashDataRef CandidateHashData::to_tl() const {
-  auto empty_fn = [&](const EmptyCandidate& empty) -> tl::CandidateHashDataRef {
-    return create_tl_object<tl::candidateHashDataEmpty>(create_tl_block_id(empty.reference), parent->to_tl());
-  };
-  auto full_fn = [&](const FullCandidate& full) -> tl::CandidateHashDataRef {
-    return create_tl_object<tl::candidateHashDataOrdinary>(create_tl_block_id(full.id), full.collated_file_hash,
-                                                           CandidateId::parent_id_to_tl(parent));
-  };
-  return std::visit(td::overloaded(empty_fn, full_fn), candidate);
+  if (blocks.size() > 1) {
+    return create_tl_object<ton_api::consensus_candidateHashDataGroup>(
+        tl_block_ids(blocks), std::vector<td::Bits256>(collated_file_hashes), CandidateId::parent_id_to_tl(parent));
+  }
+  CHECK(blocks.size() == 1);
+  if (collated_file_hashes.empty()) {
+    return create_tl_object<tl::candidateHashDataEmpty>(create_tl_block_id(blocks.front()), parent->to_tl());
+  }
+  return create_tl_object<tl::candidateHashDataOrdinary>(
+      create_tl_block_id(blocks.front()), collated_file_hashes.front(), CandidateId::parent_id_to_tl(parent));
 }
 
 td::Status check_delegation(const Delegation& delegation, const PeerValidator& leader, td::uint32 slot,
@@ -137,6 +139,9 @@ tl::DelegationRef Delegation::to_tl() const {
 
 td::Result<CandidateRef> Candidate::deserialize(td::Slice data, const Bus& bus,
                                                 std::optional<td::uint32> expected_slot) {
+  if (!bus.group_members.empty() && data.size() > Bus::max_group_candidate_bytes) {
+    return td::Status::Error("Shard group candidate exceeds wire size limit");
+  }
   if (auto maybe_broadcast = fetch_tl_object<tl::CandidateData>(data, true); maybe_broadcast.is_ok()) {
     return deserialize_data(maybe_broadcast.move_as_ok(), std::nullopt, bus, std::nullopt, expected_slot);
   }
@@ -147,7 +152,15 @@ td::Result<CandidateRef> Candidate::deserialize(td::Slice data, const Bus& bus,
 
 td::Result<CandidateRef> Candidate::deserialize_from_broadcast(td::Slice data, Signer signer, const Bus& bus,
                                                                td::uint32 expected_slot) {
+  if (!bus.group_members.empty() && data.size() > Bus::max_group_candidate_bytes) {
+    return td::Status::Error("Shard group broadcast exceeds wire size limit");
+  }
   TRY_RESULT(broadcast, fetch_tl_object<tl::CandidateData>(data, true));
+  return deserialize_broadcast_data(std::move(broadcast), std::move(signer), bus, expected_slot);
+}
+
+td::Result<CandidateRef> Candidate::deserialize_broadcast_data(tl::CandidateDataRef broadcast, Signer signer,
+                                                               const Bus& bus, td::uint32 expected_slot) {
   auto validator_fn = [&](PeerValidatorId validator) {
     return deserialize_data(std::move(broadcast), std::nullopt, bus, validator, expected_slot);
   };
@@ -164,9 +177,8 @@ td::Result<CandidateRef> Candidate::deserialize_data(tl::CandidateDataRef broadc
   struct ExtractedData {
     td::uint32 slot;
     ParentId parent_id;
-    std::variant<BlockIdExt, BlockCandidate> block;
+    CandidateContents block;
     td::BufferSlice signature;
-    CandidateHashData hash_builder;
   };
   td::Result<ExtractedData> maybe_data;
 
@@ -186,23 +198,18 @@ td::Result<CandidateRef> Candidate::deserialize_data(tl::CandidateDataRef broadc
     auto slot = static_cast<td::uint32>(empty_broadcast.slot_);
     TRY_STATUS(set_check_leader(slot));
 
-    auto block = create_block_id(empty_broadcast.block_);
-    auto parent = CandidateId::from_tl(empty_broadcast.parent_);
-    return ExtractedData{
-        .slot = slot,
-        .parent_id = parent,
-        .block = block,
-        .signature = std::move(empty_broadcast.signature_),
-        .hash_builder = CandidateHashData::create_empty(block, parent),
-    };
+    if (!bus.group_members.empty()) {
+      return td::Status::Error("Single-block reference in a shard group session");
+    }
+    return ExtractedData{slot, CandidateId::from_tl(empty_broadcast.parent_),
+                         BlockReferences{create_block_id(empty_broadcast.block_)},
+                         std::move(empty_broadcast.signature_)};
   };
 
-  auto ordinary_fn = [&](tl::block& block_broadcast) -> td::Result<ExtractedData> {
-    auto slot = static_cast<td::uint32>(block_broadcast.slot_);
-    TRY_STATUS(set_check_leader(slot));
-
-    TRY_RESULT(candidate, deserialize_payload(block_broadcast.candidate_,
-                                              bus.config.max_block_size + bus.config.max_collated_data_size + 1024));
+  auto decode_member = [&](td::Slice payload, ShardIdFull shard) -> td::Result<BlockCandidate> {
+    TRY_RESULT(candidate, deserialize_payload(payload, static_cast<int>(std::min<td::uint64>(
+                                                           0x7fffffff, td::uint64(bus.config.max_block_size) +
+                                                                           bus.config.max_collated_data_size + 1024))));
 
     if (!candidate->src_.is_zero()) {
       return td::Status::Error("src field of the candidate broadcast must be null");
@@ -215,7 +222,7 @@ td::Result<CandidateRef> Candidate::deserialize_data(tl::CandidateDataRef broadc
     }
 
     BlockIdExt block_id{
-        BlockId{bus.shard, static_cast<BlockSeqno>(candidate->round_)},
+        BlockId{shard, static_cast<BlockSeqno>(candidate->round_)},
         candidate->root_hash_,
         td::sha256_bits256(candidate->data_.as_slice()),
     };
@@ -224,26 +231,54 @@ td::Result<CandidateRef> Candidate::deserialize_data(tl::CandidateDataRef broadc
 
     Ed25519_PublicKey creator{leader.key.ed25519_value().raw()};
 
-    BlockCandidate block{
-        creator, block_id, collated_file_hash, std::move(candidate->data_), std::move(candidate->collated_data_),
-    };
-
-    auto parent = CandidateId::tl_to_parent_id(block_broadcast.parent_);
-    auto hash_builder = CandidateHashData::create_full(block, parent);
-    return ExtractedData{
-        .slot = slot,
-        .parent_id = parent,
-        .block = std::move(block),
-        .signature = std::move(block_broadcast.signature_),
-        .hash_builder = hash_builder,
-    };
+    return BlockCandidate{creator, block_id, collated_file_hash, std::move(candidate->data_),
+                          std::move(candidate->collated_data_)};
   };
 
-  ton_api::downcast_call(*broadcast,
-                         [&](auto& broadcast) { maybe_data = td::overloaded(empty_fn, ordinary_fn)(broadcast); });
+  auto ordinary_fn = [&](tl::block& b) -> td::Result<ExtractedData> {
+    auto slot = static_cast<td::uint32>(b.slot_);
+    TRY_STATUS(set_check_leader(slot));
+    if (!bus.group_members.empty()) {
+      return td::Status::Error("Single block in a shard group session");
+    }
+    TRY_RESULT(member, decode_member(b.candidate_, bus.shard));
+    CandidateBlocks blocks;
+    blocks.push_back(std::move(member));
+    return ExtractedData{slot, CandidateId::tl_to_parent_id(b.parent_), std::move(blocks), std::move(b.signature_)};
+  };
+  auto group_fn = [&](ton_api::consensus_blockGroup& b) -> td::Result<ExtractedData> {
+    auto slot = static_cast<td::uint32>(b.slot_);
+    TRY_STATUS(set_check_leader(slot));
+    if (bus.group_members.empty() || b.candidates_.size() != bus.group_members.size()) {
+      return td::Status::Error("Wrong number of shard group members");
+    }
+    CandidateBlocks blocks;
+    for (size_t i = 0; i < b.candidates_.size(); ++i) {
+      TRY_RESULT(member, decode_member(b.candidates_[i], bus.group_members[i]));
+      blocks.push_back(std::move(member));
+    }
+    return ExtractedData{slot, CandidateId::tl_to_parent_id(b.parent_), std::move(blocks), std::move(b.signature_)};
+  };
+  auto group_empty_fn = [&](ton_api::consensus_emptyGroup& b) -> td::Result<ExtractedData> {
+    auto slot = static_cast<td::uint32>(b.slot_);
+    TRY_STATUS(set_check_leader(slot));
+    if (bus.group_members.empty() || b.blocks_.size() != bus.group_members.size()) {
+      return td::Status::Error("Incomplete shard group reference");
+    }
+    BlockReferences refs;
+    for (size_t i = 0; i < b.blocks_.size(); ++i) {
+      refs.push_back(create_block_id(b.blocks_[i]));
+      if (refs.back().shard_full() != bus.group_members[i]) {
+        return td::Status::Error("Wrong shard in empty group candidate");
+      }
+    }
+    return ExtractedData{slot, CandidateId::from_tl(b.parent_), std::move(refs), std::move(b.signature_)};
+  };
+  ton_api::downcast_call(
+      *broadcast, [&](auto& b) { maybe_data = td::overloaded(empty_fn, ordinary_fn, group_fn, group_empty_fn)(b); });
   TRY_RESULT(parsed, std::move(maybe_data));
 
-  auto id = parsed.hash_builder.build_id_with(parsed.slot);
+  auto id = CandidateHashData::from(parsed.block, parsed.parent_id).build_id_with(parsed.slot);
   auto signed_data = serialize_tl_object(id.to_tl(), true);
 
   if (delegation.has_value()) {
@@ -260,33 +295,54 @@ td::Result<CandidateRef> Candidate::deserialize_data(tl::CandidateDataRef broadc
 }
 
 BlockIdExt Candidate::block_id() const {
-  auto empty_fn = [&](const BlockIdExt& referenced_block) { return referenced_block; };
-  auto full_fn = [&](const BlockCandidate& candidate) { return candidate.id; };
-  return std::visit(td::overloaded(empty_fn, full_fn), block);
+  return is_empty() ? std::get<BlockReferences>(block).front() : blocks().front().id;
+}
+
+BlockReferences Candidate::block_ids() const {
+  return hash_data().blocks;
 }
 
 CandidateHashData Candidate::hash_data() const {
-  auto empty_fn = [&](const BlockIdExt& referenced_block) {
-    return CandidateHashData::create_empty(referenced_block, parent_id.value());
-  };
-  auto block_fn = [&](const BlockCandidate& candidate) { return CandidateHashData::create_full(candidate, parent_id); };
-  return std::visit(td::overloaded(empty_fn, block_fn), block);
+  return CandidateHashData::from(block, parent_id);
+}
+
+td::Result<td::BufferSlice> Candidate::encode_block(const BlockCandidate& candidate) {
+  return serialize_payload(
+      create_tl_object<ton_api::validatorSession_candidate>(td::Bits256{}, candidate.id.seqno(), candidate.id.root_hash,
+                                                            candidate.data.clone(), candidate.collated_data.clone()));
+}
+
+std::vector<td::BufferSlice> Candidate::encoded_blocks() const {
+  std::vector<td::BufferSlice> payloads;
+  if (encoded_members_.empty()) {
+    for (const auto& member : blocks()) {
+      payloads.push_back(encode_block(member).move_as_ok());
+    }
+  } else {
+    for (const auto& encoded : encoded_members_) {
+      payloads.push_back(encoded.clone());
+    }
+  }
+  return payloads;
 }
 
 tl::CandidateDataRef Candidate::to_data_tl() const {
-  auto empty_fn = [&](const BlockIdExt& referenced_block) -> tl::CandidateDataRef {
-    return create_tl_object<tl::empty>(id.slot, parent_id->to_tl(), create_tl_block_id(referenced_block),
+  if (is_empty()) {
+    const auto& refs = std::get<BlockReferences>(block);
+    if (refs.size() > 1) {
+      return create_tl_object<ton_api::consensus_emptyGroup>(id.slot, parent_id->to_tl(), tl_block_ids(refs),
+                                                             signature.clone());
+    }
+    return create_tl_object<tl::empty>(id.slot, parent_id->to_tl(), create_tl_block_id(refs.front()),
                                        signature.clone());
-  };
-  auto block_fn = [&](const BlockCandidate& candidate) -> tl::CandidateDataRef {
-    auto candidate_tl = create_tl_object<ton_api::validatorSession_candidate>(
-        td::Bits256{}, candidate.id.seqno(), candidate.id.root_hash, candidate.data.clone(),
-        candidate.collated_data.clone());
-
-    return create_tl_object<tl::block>(id.slot, CandidateId::parent_id_to_tl(parent_id),
-                                       serialize_payload(candidate_tl).move_as_ok(), signature.clone());
-  };
-  return std::visit(td::overloaded(empty_fn, block_fn), block);
+  }
+  auto payloads = encoded_blocks();
+  if (payloads.size() > 1) {
+    return create_tl_object<ton_api::consensus_blockGroup>(id.slot, CandidateId::parent_id_to_tl(parent_id),
+                                                           std::move(payloads), signature.clone());
+  }
+  return create_tl_object<tl::block>(id.slot, CandidateId::parent_id_to_tl(parent_id), std::move(payloads.front()),
+                                     signature.clone());
 }
 
 td::BufferSlice Candidate::serialize() const {
@@ -301,7 +357,7 @@ td::BufferSlice Candidate::serialize_for_broadcast() const {
 }
 
 bool Candidate::is_empty() const {
-  return std::holds_alternative<BlockIdExt>(block);
+  return std::holds_alternative<BlockReferences>(block);
 }
 
 adnl::AdnlNodeIdShort Candidate::collated_by(const Bus& bus) const {

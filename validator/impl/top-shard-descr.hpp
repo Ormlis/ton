@@ -59,6 +59,9 @@ class ShardTopBlockDescrQ final : public ShardTopBlockDescrQBase {
   td::BufferSlice serialize() const override {
     return data_.clone();
   }
+  std::vector<BlockIdExt> group_blocks() const override {
+    return sig_set_.is_null() ? std::vector<BlockIdExt>{} : sig_set_->group_blocks();
+  }
   bool before_split() const override {
     return before_split_;
   }

@@ -61,12 +61,14 @@ class CandidateBroadcastRelayImpl : public td::actor::SpawnsWith<Bus>, public td
       return;
     }
 
-    const auto &block = std::get<BlockCandidate>(candidate->block);
     auto &entry = slots_[candidate->id.slot];
     if (entry.candidate.has_value() && entry.candidate->id != candidate->id) {
       return;
     }
-    entry.candidate = CachedCandidate{candidate->id, block.id, block.data.clone()};
+    entry.candidate = CachedCandidate{candidate->id, {}};
+    for (const auto &block : candidate->blocks()) {
+      entry.candidate->blocks.emplace_back(block.id, block.data.clone());
+    }
     maybe_broadcast(bus, candidate->id.slot);
   }
 
@@ -99,8 +101,7 @@ class CandidateBroadcastRelayImpl : public td::actor::SpawnsWith<Bus>, public td
  private:
   struct CachedCandidate {
     CandidateId id;
-    BlockIdExt block_id;
-    td::BufferSlice data;
+    std::vector<std::pair<BlockIdExt, td::BufferSlice>> blocks;
   };
 
   struct SlotEntry {
@@ -136,16 +137,17 @@ class CandidateBroadcastRelayImpl : public td::actor::SpawnsWith<Bus>, public td
       return;
     }
 
-    BlockIdExt block_id = entry.candidate->block_id;
-    td::BufferSlice data = entry.candidate->data.clone();
+    auto blocks = std::move(entry.candidate->blocks);
     slots_.erase(it);
 
     int mode = fullnode::FullNode::broadcast_mode_custom | fullnode::FullNode::broadcast_mode_protected;
     if (bus->is_collator) {
       mode = fullnode::FullNode::broadcast_mode_custom;
     }
-    td::actor::send_closure(bus->manager, &ManagerFacade::send_block_candidate_broadcast, block_id, std::move(data),
-                            mode);
+    for (auto &[block_id, data] : blocks) {
+      td::actor::send_closure(bus->manager, &ManagerFacade::send_block_candidate_broadcast, block_id, std::move(data),
+                              mode);
+    }
   }
 
   void prune() {

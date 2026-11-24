@@ -22,12 +22,11 @@ std::string block_candidate_to_string(const BlockCandidate& candidate) {
 }
 
 std::string candidate_to_string(const CandidateRef& candidate) {
-  auto block_fn = [](const BlockCandidate& block) { return block_candidate_to_string(block); };
-  auto empty_fn = [](const BlockIdExt& id) { return PSTRING() << id << " (referenced)"; };
-
   return PSTRING() << "Candidate{id=" << candidate->id << ", parent=" << candidate->parent_id
-                   << ", leader=" << candidate->leader
-                   << ", block=" << std::visit(td::overloaded(block_fn, empty_fn), candidate->block) << "}";
+                   << ", leader=" << candidate->leader << ", block="
+                   << (candidate->is_empty() ? candidate->block_id().to_str()
+                                             : block_candidate_to_string(candidate->blocks().front()))
+                   << "}";
 }
 
 std::string message_to_string(const ProtocolMessage& message) {

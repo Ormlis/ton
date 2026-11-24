@@ -126,38 +126,18 @@ using ParentId = std::optional<CandidateId>;
 td::StringBuilder& operator<<(td::StringBuilder& stream, const CandidateId& id);
 td::StringBuilder& operator<<(td::StringBuilder& stream, const ParentId& id);
 
-struct CandidateHashData;
+using BlockReferences = std::vector<BlockIdExt>;
+using CandidateBlocks = std::vector<BlockCandidate>;
+using CandidateContents = std::variant<BlockReferences, CandidateBlocks>;
 
 struct CandidateHashData {
-  struct EmptyCandidate {
-    BlockIdExt reference;
-  };
+  BlockReferences blocks;
+  std::vector<FileHash> collated_file_hashes;
+  ParentId parent;
 
-  struct FullCandidate {
-    BlockIdExt id;
-    td::Bits256 collated_file_hash;
-  };
-
-  static CandidateHashData create_empty(BlockIdExt reference, CandidateId parent) {
-    return {EmptyCandidate{reference}, parent};
-  }
-
-  static CandidateHashData create_full(FullCandidate candidate, ParentId parent) {
-    return {candidate, parent};
-  }
-
-  static CandidateHashData create_full(const BlockCandidate& candidate, ParentId parent) {
-    return {FullCandidate{candidate.id, candidate.collated_file_hash}, parent};
-  }
-
-  static CandidateHashData from_tl(tl::CandidateHashData&& data);
-
-  BlockIdExt block() const;
+  static CandidateHashData from(const CandidateContents& contents, ParentId parent);
   CandidateId build_id_with(td::uint32 slot) const;
   tl::CandidateHashDataRef to_tl() const;
-
-  std::variant<EmptyCandidate, FullCandidate> candidate;
-  ParentId parent;
 };
 
 struct Delegation {
@@ -180,18 +160,29 @@ struct Candidate : td::CntObject {
   static td::Result<td::Ref<Candidate>> deserialize_from_broadcast(td::Slice data, Signer signer, const Bus& bus,
                                                                    td::uint32 expected_slot);
 
-  Candidate(CandidateId id, ParentId parent_id, PeerValidatorId leader, std::variant<BlockIdExt, BlockCandidate> block,
-            td::BufferSlice signature, std::optional<Delegation> delegation = std::nullopt)
-      : id(id)
+  static td::Result<td::Ref<Candidate>> deserialize_broadcast_data(tl::CandidateDataRef data, Signer signer,
+                                                                   const Bus& bus, td::uint32 expected_slot);
+  std::vector<td::BufferSlice> encoded_blocks() const;
+  static td::Result<td::BufferSlice> encode_block(const BlockCandidate& block);
+
+  Candidate(CandidateId id, ParentId parent_id, PeerValidatorId leader, CandidateContents block,
+            td::BufferSlice signature, std::optional<Delegation> delegation = std::nullopt,
+            std::vector<td::BufferSlice> encoded_members = {})
+      : encoded_members_(std::move(encoded_members))
+      , id(id)
       , parent_id(std::move(parent_id))
       , leader(leader)
       , block(std::move(block))
       , signature(std::move(signature))
       , delegation(std::move(delegation)) {
-    CHECK(std::holds_alternative<BlockCandidate>(this->block) || this->parent_id.has_value());
+    CHECK(std::holds_alternative<CandidateBlocks>(this->block) || this->parent_id.has_value());
   }
 
   BlockIdExt block_id() const;
+  BlockReferences block_ids() const;
+  const CandidateBlocks& blocks() const {
+    return std::get<CandidateBlocks>(block);
+  }
   CandidateHashData hash_data() const;
   td::BufferSlice serialize() const;
   td::BufferSlice serialize_for_broadcast() const;
@@ -205,12 +196,13 @@ struct Candidate : td::CntObject {
                                                          std::optional<td::uint32> expected_slot);
 
   tl::CandidateDataRef to_data_tl() const;
+  std::vector<td::BufferSlice> encoded_members_;
 
  public:
   CandidateId id;
   ParentId parent_id;
   PeerValidatorId leader;
-  std::variant<BlockIdExt, BlockCandidate> block;
+  CandidateContents block;
   td::BufferSlice signature;
   std::optional<Delegation> delegation;
 };

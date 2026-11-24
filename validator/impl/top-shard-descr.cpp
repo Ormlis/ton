@@ -432,6 +432,16 @@ td::Result<int> ShardTopBlockDescrQ::validate_internal(BlockIdExt last_mc_block_
                                        << " while the current masterchain configuration expects "
                                        << vset->get_validator_set_hash() << " and " << vset->get_catchain_seqno());
   }
+  auto members = state->active_shard_group(shard());
+  auto blocks = group_blocks();
+  if (members.size() != blocks.size()) {
+    return td::Status::Error("Shard top certificate does not cover the active shard group");
+  }
+  for (size_t i = 0; i < members.size(); ++i) {
+    if (blocks[i].shard_full() != members[i] || (members[i] == shard() && blocks[i] != block_id_)) {
+      return td::Status::Error("Unexpected member in shard group certificate");
+    }
+  }
   // check signatures
   if ((mode & skip_check_sig) || is_fake_ || sig_ok_) {
     return res;

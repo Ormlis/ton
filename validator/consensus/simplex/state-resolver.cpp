@@ -118,27 +118,26 @@ class StateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
   td::actor::Task<ResolvedState> resolve_state_inner(ParentId id) {
     if (!id.has_value()) {
       auto genesis = co_await genesis_.get();
-      auto state = co_await ChainState::from_manager(owning_bus()->manager, owning_bus()->shard,
-                                                     genesis->state->block_ids(), genesis->state->min_mc_block_id());
-      co_return ResolvedState{state, std::nullopt};
+      co_return ResolvedState{genesis->state, std::nullopt};
     }
 
     auto candidate = (co_await owning_bus().publish<ResolveCandidate>(*id)).candidate;
     if (candidate->is_empty()) {
       co_return co_await resolve_state(candidate->parent_id);
     }
-    auto gen_utime_exact = get_candidate_gen_utime_exact(std::get<BlockCandidate>(candidate->block)).move_as_ok();
+    auto gen_utime_exact = get_candidate_gen_utime_exact(candidate->blocks().front()).move_as_ok();
 
     if (is_finalized(*id)) {
       auto genesis = co_await genesis_.get();
-      auto state = co_await ChainState::from_manager(owning_bus()->manager, owning_bus()->shard,
-                                                     {candidate->block_id()}, genesis->state->min_mc_block_id());
+      auto state =
+          co_await ChainState::from_group(owning_bus()->manager, owning_bus()->shard, owning_bus()->group_members,
+                                          candidate->block_ids(), genesis->state->min_mc_block_id());
       co_return ResolvedState{state, gen_utime_exact};
     }
 
     auto prev_data_state = co_await resolve_state(candidate->parent_id);
     co_return ResolvedState{
-        .state = prev_data_state.state->apply(std::get<BlockCandidate>(candidate->block)),
+        .state = prev_data_state.state->apply_blocks(candidate->blocks()),
         .gen_utime_exact = gen_utime_exact,
     };
   }

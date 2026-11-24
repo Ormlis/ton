@@ -117,12 +117,21 @@ class ChainState : public td::CntObject {
   static td::actor::Task<td::Ref<ChainState>> from_manager(td::actor::ActorId<ManagerFacade> manager, ShardIdFull shard,
                                                            std::vector<BlockIdExt> blocks, BlockIdExt min_mc_block_id);
 
+  static td::actor::Task<td::Ref<ChainState>> from_group(td::actor::ActorId<ManagerFacade> manager, ShardIdFull shard,
+                                                         std::vector<ShardIdFull> members,
+                                                         std::vector<BlockIdExt> blocks, BlockIdExt min_mc_block_id);
   ChainState(Tip tip, BlockIdExt min_mc_block_id);
+  explicit ChainState(std::vector<td::Ref<ChainState>> members);
+  const ChainState& member(size_t i) const {
+    return members_.empty() ? *this : *members_.at(i);
+  }
+  td::Ref<ChainState> apply_blocks(const std::vector<BlockCandidate>& blocks) const;
 
   std::vector<BlockIdExt> block_ids() const;
   std::vector<td::Ref<BlockData>> block_data() const;
   std::vector<td::Ref<vm::Cell>> state() const;
   BlockIdExt min_mc_block_id() const;
+  td::Result<std::shared_ptr<const ShardGroupMessageOrder>> group_message_order() const;
 
   BlockSeqno next_seqno() const;
   bool is_before_split() const;
@@ -132,6 +141,7 @@ class ChainState : public td::CntObject {
   td::Ref<ChainState> apply(const BlockCandidate& candidate) const;
 
  private:
+  std::vector<td::Ref<ChainState>> members_;
   Tip tip_;
   BlockIdExt min_mc_block_id_;
   td::Ref<vm::Cell> root_;

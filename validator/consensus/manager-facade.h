@@ -13,6 +13,10 @@ namespace ton::validator::consensus {
 
 class ManagerFacade : public td::actor::Actor {
  public:
+  virtual td::actor::Task<td::Ref<MasterchainState>> group_masterchain_state() {
+    co_return td::Status::Error("Shard group collation unavailable");
+  }
+
   virtual td::actor::Task<GeneratedCandidate> collate_block(CollateParams params,
                                                             td::CancellationToken cancellation_token) = 0;
 
@@ -20,9 +24,9 @@ class ManagerFacade : public td::actor::Actor {
                                                                             ValidateParams params,
                                                                             td::Timestamp timeout) = 0;
 
-  virtual td::actor::Task<> accept_block(BlockIdExt id, td::Ref<BlockData> data, size_t creator_idx,
-                                         td::Ref<block::BlockSignatureSet> signatures, int finality_broadcast_mode,
-                                         bool apply) = 0;
+  virtual td::actor::Task<> accept_blocks(std::vector<td::Ref<BlockData>> blocks, size_t creator_idx,
+                                          td::Ref<block::BlockSignatureSet> signatures, int finality_broadcast_mode,
+                                          bool apply) = 0;
 
   virtual td::actor::Task<td::Ref<vm::Cell>> wait_block_state_root(BlockIdExt block_id, td::Timestamp timeout) = 0;
   virtual td::actor::Task<td::Ref<BlockData>> wait_block_data(BlockIdExt block_id, td::Timestamp timeout) = 0;

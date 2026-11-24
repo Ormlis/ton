@@ -105,8 +105,8 @@ td::Result<tl_object_ptr<ton_api::validatorSession_candidate>> deserialize_paylo
               },
               [&](ton_api::validatorSession_compressedCandidate& c) {
                 res = [&]() -> td::Result<tl_object_ptr<ton_api::validatorSession_candidate>> {
-                  if (c.decompressed_size_ > max_decompressed_data_size) {
-                    return td::Status::Error("decompressed size is too big");
+                  if (c.decompressed_size_ <= 0 || c.decompressed_size_ > max_decompressed_data_size) {
+                    return td::Status::Error("Invalid decompressed candidate size");
                   }
                   TRY_RESULT(p,
                              decompress_candidate_data(c.data_, false, c.decompressed_size_, max_decompressed_data_size,

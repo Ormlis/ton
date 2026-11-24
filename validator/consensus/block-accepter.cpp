@@ -4,8 +4,6 @@
  * SPDX-License-Identifier: LGPL-2.0-or-later
  */
 
-#include <set>
-
 #include "validator/full-node.h"
 
 #include "bus.h"
@@ -27,18 +25,19 @@ class BlockAccepterImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
   template <>
   td::actor::Task<> process(BusHandle, std::shared_ptr<FinalizeBlock> event) {
     auto& bus = *owning_bus();
-    const auto& block = std::get<BlockCandidate>(event->candidate->block);
-    auto block_data = create_block(block.id, block.data.clone()).move_as_ok();
-    int finality_broadcast_mode =
-        block.id.seqno() + 8 > last_mc_finalized_seqno_
-            ? (fullnode::FullNode::broadcast_mode_custom | fullnode::FullNode::broadcast_mode_protected)
-            : 0;
-    if (bus.is_collator) {
-      finality_broadcast_mode &= fullnode::FullNode::broadcast_mode_custom;
+    std::vector<td::Ref<BlockData>> blocks;
+    for (const auto& block : event->candidate->blocks()) {
+      blocks.push_back(CO_TRY(create_block(block.id, block.data.clone())));
     }
-    co_await td::actor::ask(bus.manager, &ManagerFacade::accept_block, block.id, block_data,
-                            event->candidate->leader.value(), event->signatures, finality_broadcast_mode,
-                            /* accept = */ true);
+    int broadcast_mode = 0;
+    if (td::uint64(blocks.front()->block_id().seqno()) + 8 > last_mc_finalized_seqno_) {
+      broadcast_mode = fullnode::FullNode::broadcast_mode_custom;
+      if (!bus.is_collator) {
+        broadcast_mode |= fullnode::FullNode::broadcast_mode_protected;
+      }
+    }
+    co_await td::actor::ask(bus.manager, &ManagerFacade::accept_blocks, std::move(blocks),
+                            event->candidate->leader.value(), event->signatures, broadcast_mode, true);
     owning_bus().publish<TraceEvent>(stats::BlockAccepted::create(event->candidate));
     co_return {};
   }

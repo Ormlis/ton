@@ -34,6 +34,9 @@ class BlockSignatureSet : public td::CntObject {
     return false;
   }
   virtual bool is_final() const = 0;
+  virtual std::vector<ton::BlockIdExt> group_blocks() const {
+    return {};
+  }
 
   td::Result<ton::ValidatorWeight> check_signatures(td::Ref<ValidatorSet> vset, ton::BlockIdExt block_id) const {
     if (!is_final()) {

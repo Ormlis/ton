@@ -40,6 +40,7 @@ struct Genesis {
 
 struct SessionInfo {
   ShardIdFull shard;
+  std::vector<ShardIdFull> members;
   td::Ref<block::ValidatorSet> validator_set;
   ValidatorSessionId session_id;
   NewConsensusConfig config;
@@ -144,7 +145,9 @@ std::vector<GroupIdentity> identities_for(const Context &ctx, const td::Ref<bloc
   return identities;
 }
 
-ValidatorSessionId session_id_for(const Context &ctx, ShardIdFull shard, const td::Ref<block::ValidatorSet> &val_set) {
+ValidatorSessionId session_id_for(const Context &ctx, ShardIdFull shard, const td::Ref<block::ValidatorSet> &val_set,
+                                  const std::vector<ShardIdFull> &members,
+                                  const RootHash &topology_mc_root = RootHash::zero()) {
   std::vector<tl_object_ptr<ton_api::validator_groupMember>> vec;
   for (auto &n : val_set->export_vector()) {
     auto pub = PublicKey{pubkeys::Ed25519{n.key}};
@@ -159,12 +162,21 @@ ValidatorSessionId session_id_for(const Context &ctx, ShardIdFull shard, const t
     std::memcpy(opts_hash.as_slice().data(), &ctx.unsafe_rotate_id, sizeof(ctx.unsafe_rotate_id));
   }
 
-  return create_hash_tl_object<tl::groupNew>(shard.workchain, shard.shard, ctx.deps.opts->get_maximal_vertical_seqno(),
-                                             ctx.state.last_key_block_id().seqno(), val_set->get_catchain_seqno(),
-                                             opts_hash, std::move(vec));
+  auto id = create_hash_tl_object<tl::groupNew>(
+      shard.workchain, shard.shard, ctx.deps.opts->get_maximal_vertical_seqno(), ctx.state.last_key_block_id().seqno(),
+      val_set->get_catchain_seqno(), opts_hash, std::move(vec));
+  if (members.empty() && topology_mc_root.is_zero()) {
+    return id;
+  }
+  std::vector<td::int64> shards;
+  for (auto member : members) {
+    shards.push_back(member.shard);
+  }
+  return create_hash_tl_object<ton_api::validator_shardGroup>(id, std::move(shards), topology_mc_root);
 }
 
 SessionInfo session_info(const Context &ctx, ShardIdFull shard, td::Ref<block::ValidatorSet> validator_set,
+                         const std::vector<ShardIdFull> &members, ValidatorSessionId session_id,
                          td::Timestamp expected_start_time = td::Timestamp::never()) {
   auto config = ctx.state.get_new_consensus_config(shard.workchain);
 
@@ -175,8 +187,9 @@ SessionInfo session_info(const Context &ctx, ShardIdFull shard, td::Ref<block::V
 
   return {
       .shard = shard,
+      .members = members,
       .validator_set = validator_set,
-      .session_id = session_id_for(ctx, shard, validator_set),
+      .session_id = session_id,
       .config = config,
       .overlay_members = ctx.overlay_members.all,
       .all_current_validators = ctx.overlay_members.all_current_validators,
@@ -189,6 +202,7 @@ td::actor::ActorOwn<IValidatorGroup> make_group(const Context &ctx, const Sessio
                                                 const GroupIdentity &identity) {
   GroupParams params{
       .shard = info.shard,
+      .members = info.members,
       .manager = ctx.deps.manager,
       .keyring = ctx.deps.keyring,
       .validator_opts = ctx.deps.opts,
@@ -395,13 +409,10 @@ class GroupSlot {
     }
   }
 
-  void reconcile(const Context &ctx, const Genesis &genesis, std::map<ValidatorSessionId, Group> &future) {
-    auto val_set = ctx.state.get_validator_set(shard_);
-    if (val_set.is_null()) {
-      drop();
-      return;
-    }
-    auto info = session_info(ctx, shard_, val_set);
+  void reconcile(const Context &ctx, const Genesis &genesis, const std::vector<ShardIdFull> &members,
+                 td::Ref<block::ValidatorSet> val_set, ValidatorSessionId session_id,
+                 std::map<ValidatorSessionId, Group> &future) {
+    auto info = session_info(ctx, shard_, std::move(val_set), members, session_id);
     if (groups_ && groups_->session_id != info.session_id) {
       drop();
     }
@@ -487,14 +498,37 @@ class ShardTree {
     auto val_set = ctx.state.get_validator_set(shard_);
     CHECK(val_set.not_null());
 
-    auto session_id = session_id_for(ctx, shard_, val_set);
+    auto members = ctx.state.active_shard_group(shard_);
+    // Replaying masterchain states reconstructs the same anchor after a restart. If the topology
+    // changes twice within one catchain, never reopen the earlier consensus database or overlay.
+    auto cc = val_set->get_catchain_seqno();
+    if (last_cc_ != cc) {
+      topology_mc_root_.set_zero();
+    } else if (member_count_ != members.size()) {
+      topology_mc_root_ = ctx.state.get_block_id().root_hash;
+    }
+    last_cc_ = cc;
+    member_count_ = members.size();
+    if (!members.empty() && shard_ != members.front()) {
+      slot_.drop();
+      genesis_.reset();
+      session_.reset();
+      return;
+    }
+    auto session_id = session_id_for(ctx, shard_, val_set, members, topology_mc_root_);
     if (!genesis_ || session_ != session_id) {
       genesis_ = Genesis{blocks, ctx.state.get_block_id()};
+      if (!members.empty()) {
+        genesis_->blocks.clear();
+        for (auto member : members) {
+          genesis_->blocks.push_back(ctx.state.get_shard_from_config(member)->top_block_id());
+        }
+      }
     }
     session_ = session_id;
 
     if (ctx.should_manage_groups) {
-      slot_.reconcile(ctx, *genesis_, future);
+      slot_.reconcile(ctx, *genesis_, members, std::move(val_set), session_id, future);
     }
   }
 
@@ -517,6 +551,9 @@ class ShardTree {
   std::optional<Genesis> genesis_;
   std::optional<ValidatorSessionId> session_;
   GroupSlot slot_;
+  CatchainSeqno last_cc_ = ~0U;
+  size_t member_count_ = 0;
+  RootHash topology_mc_root_ = RootHash::zero();
 };
 
 class WorkchainState {
@@ -557,7 +594,12 @@ class WorkchainState {
       if (val_set.is_null()) {
         continue;
       }
-      auto info = session_info(ctx, shard, val_set, expected_start_time);
+      auto members = ctx.state.active_shard_group(shard);
+      if (!members.empty() && shard != members.front()) {
+        continue;
+      }
+      auto info =
+          session_info(ctx, shard, val_set, members, session_id_for(ctx, shard, val_set, members), expected_start_time);
       if (info.identities.empty()) {
         continue;
       }

@@ -161,9 +161,7 @@ ConcludedDelegation::ConcludedDelegation(td::uint32 start_slot, adnl::AdnlNodeId
 }
 
 std::unique_ptr<CandidateReceived> CandidateReceived::create(const CandidateRef& candidate, bool is_collator) {
-  auto empty_fn = [&](const BlockIdExt&) { return std::optional<BlockIdExt>{}; };
-  auto candidate_fn = [&](const BlockCandidate& candidate_block) { return std::optional{candidate_block.id}; };
-  auto block = std::visit(td::overloaded(empty_fn, candidate_fn), candidate->block);
+  std::optional<BlockIdExt> block = candidate->is_empty() ? std::nullopt : std::optional{candidate->block_id()};
   std::optional<adnl::AdnlNodeIdShort> collator_node;
   if (candidate->delegation) {
     collator_node = adnl::AdnlNodeIdShort{candidate->delegation->collator_key.compute_short_id()};

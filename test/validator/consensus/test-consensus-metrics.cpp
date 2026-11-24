@@ -48,7 +48,7 @@ CandidateRef empty_candidate(td::uint32 slot, bool delegated = false) {
   CHECK(slot > 0);
   auto id = candidate_id(slot);
   ParentId parent = candidate_id(slot - 1);
-  std::variant<BlockIdExt, BlockCandidate> block{BlockIdExt{}};
+  CandidateContents block{BlockReferences{BlockIdExt{}}};
   return td::make_ref<Candidate>(id, parent, kLocal, std::move(block), td::BufferSlice{}, delegation_if(delegated));
 }
 
@@ -57,7 +57,8 @@ CandidateRef full_candidate(td::uint32 slot, bool delegated = false) {
   ParentId parent = slot == 0 ? std::nullopt : ParentId{candidate_id(slot - 1)};
   BlockCandidate candidate;
   candidate.id = BlockIdExt{};
-  std::variant<BlockIdExt, BlockCandidate> block{std::move(candidate)};
+  CandidateContents block{CandidateBlocks{}};
+  std::get<CandidateBlocks>(block).push_back(std::move(candidate));
   return td::make_ref<Candidate>(id, parent, kLocal, std::move(block), td::BufferSlice{}, delegation_if(delegated));
 }
 

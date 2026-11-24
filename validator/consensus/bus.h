@@ -218,6 +218,15 @@ class Bus : public td::actor::Bus {
   ValidatorSessionId session_id;
 
   ShardIdFull shard;
+  std::vector<ShardIdFull> group_members;
+  // Leave space for a notarization certificate when a peer resolves the candidate through a TL bytes field.
+  static constexpr size_t max_group_candidate_bytes = (15 << 20);
+  td::uint32 candidate_size_limit() const {
+    td::uint64 member = td::uint64(config.max_block_size) + config.max_collated_data_size + (1 << 20);
+    return static_cast<td::uint32>(group_members.empty() ? std::min<td::uint64>(member, 0x7fffffff)
+                                                         : std::min<td::uint64>(member * group_members.size(),
+                                                                                max_group_candidate_bytes + (1 << 20)));
+  }
   td::actor::ActorId<ManagerFacade> manager;
   td::actor::ActorId<keyring::Keyring> keyring;
   mutable td::AtomicRef<ValidatorManagerOptions> validator_opts;

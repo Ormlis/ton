@@ -227,7 +227,7 @@ td::Status ValidatorManagerImpl::check_need_generate_shard_block_description(Blo
     return td::Status::Error(ErrorCode::notready, "out of sync");
   }
   auto it = shard_blocks_.find(ShardTopBlockDescriptionId{block_id.shard_full(), cc_seqno});
-  if (it != shard_blocks_.end() && block_id.id.seqno <= it->second.latest_desc->block_id().id.seqno) {
+  if (it != shard_blocks_.end() && it->second.already_have(block_id.seqno())) {
     return td::Status::Error("duplicate shard block description (1)");
   }
   if (active_shard_block_desc_generation_.contains(block_id)) {
@@ -266,10 +266,21 @@ td::actor::Task<> ValidatorManagerImpl::generate_shard_block_description(BlockId
     co_return td::Status::Error("outdated shard block desc");
   }
   auto it = shard_blocks_.find(ShardTopBlockDescriptionId{desc->shard(), desc->catchain_seqno()});
-  if (it != shard_blocks_.end() && desc->block_id().id.seqno <= it->second.latest_desc->block_id().id.seqno) {
+  if (it != shard_blocks_.end() && it->second.already_have(desc->block_id().seqno())) {
     co_return td::Status::Error("duplicate shard block description");
   }
-  shard_blocks_[ShardTopBlockDescriptionId{desc->block_id().shard_full(), desc->catchain_seqno()}].latest_desc = desc;
+  auto &cached = shard_blocks_[{desc->shard(), desc->catchain_seqno()}];
+  if (!desc->group_blocks().empty()) {
+    cached.group_rounds.emplace(desc->block_id().seqno(), desc);
+    auto last = cached.group_rounds.rbegin()->first;
+    while (last - cached.group_rounds.begin()->first >= 8) {
+      cached.group_rounds.erase(cached.group_rounds.begin());
+    }
+    cached.latest_desc = cached.group_rounds.rbegin()->second;
+  } else {
+    cached.group_rounds.clear();
+    cached.latest_desc = desc;
+  }
   co_return {};
 }
 
@@ -1131,7 +1142,13 @@ void ValidatorManagerImpl::get_shard_blocks_for_collator(
     if (b.second.latest_desc.is_null()) {
       continue;
     }
-    v.push_back(b.second.latest_desc);
+    if (b.second.group_rounds.empty()) {
+      v.push_back(b.second.latest_desc);
+    } else {
+      for (const auto &[_, desc] : b.second.group_rounds) {
+        v.push_back(desc);
+      }
+    }
   }
   promise.set_value(std::move(v));
 }

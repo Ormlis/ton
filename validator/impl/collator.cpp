@@ -1981,39 +1981,96 @@ bool Collator::import_new_shard_top_blocks() {
   Ref<block::McShardHash> prev_descr;
   ShardIdFull prev_shard{ton::workchainInvalid, ~0ULL};
   int prev_chain_len = 0;
-  for (auto entry : shard_block_descr_) {
-    auto sh_bd = Ref<ShardTopBlockDescrQ>(entry);
-    FAIL_UNLESS(sh_bd.not_null());
+  struct PreparedTop {
+    Ref<ShardTopBlockDescrQ> proof;
+    Ref<block::McShardHash> descr;
+    std::vector<BlockIdExt> prev;
+    int length;
+    bool standalone;
+  };
+  auto prepare = [&](Ref<ShardTopBlockDescrQ> sh_bd) -> std::optional<PreparedTop> {
     int res_flags = 0;
     auto chk_res = sh_bd->prevalidate(mc_block_id_, mc_state_,
                                       ShardTopBlockDescrQ::fail_new | ShardTopBlockDescrQ::fail_too_new, res_flags);
     if (chk_res.is_error()) {
       LOG(DEBUG) << "ShardTopBlockDescr for " << sh_bd->block_id() << " skipped: res_flags=" << res_flags << " "
                  << chk_res.move_as_error().to_string();
-      continue;
+      return {};
     }
     int chain_len = chk_res.move_as_ok();
     if (chain_len <= 0 || chain_len > 8) {
       LOG(DEBUG) << "ShardTopBlockDescr for " << sh_bd->block_id() << " skipped: its chain length is " << chain_len;
-      continue;
+      return {};
     }
     if (allow_same_timestamp_ ? sh_bd->generated_at() > now_ : sh_bd->generated_at() >= now_) {
       LOG(DEBUG) << "ShardTopBlockDescr for " << sh_bd->block_id() << " skipped: it claims to be generated at "
                  << sh_bd->generated_at() << " while it is still " << now_;
-      continue;
+      return {};
     }
     Ref<block::McShardHash> descr = sh_bd->get_top_descr(chain_len);
-    FAIL_UNLESS(descr.not_null());
-    FAIL_UNLESS(descr->top_block_id() == sh_bd->block_id());
-    ShardIdFull shard = ShardIdFull(descr->top_block_id());
+    if (descr.is_null() || descr->top_block_id() != sh_bd->block_id()) {
+      return {};
+    }
     auto start_blks = sh_bd->get_prev_at(chain_len);
     auto res = shard_conf_->may_update_shard_block_info(descr, start_blks, lt_limit);
     if (res.is_error()) {
       LOG(DEBUG) << "cannot add new top shard block " << sh_bd->block_id()
                  << " to shard configuration: " << res.move_as_error().to_string();
+      return {};
+    }
+    return PreparedTop{sh_bd, std::move(descr), std::move(start_blks), chain_len, res.move_as_ok()};
+  };
+  std::map<BlockIdExt, Ref<ShardTopBlockDescrQ>> group_proofs;
+  for (const auto& entry : shard_block_descr_) {
+    if (!entry->group_blocks().empty()) {
+      group_proofs.emplace(entry->block_id(), Ref<ShardTopBlockDescrQ>{entry});
+    }
+  }
+  for (auto entry : shard_block_descr_) {
+    auto sh_bd = Ref<ShardTopBlockDescrQ>(entry);
+    auto manifest = sh_bd->group_blocks();
+    if (!manifest.empty()) {
+      if (manifest.front() != sh_bd->block_id()) {
+        continue;
+      }
+      std::vector<PreparedTop> group;
+      for (const auto& id : manifest) {
+        auto it = group_proofs.find(id);
+        if (it == group_proofs.end() || it->second->group_blocks() != manifest) {
+          break;
+        }
+        auto top = prepare(it->second);
+        if (!top || !top->standalone) {
+          break;
+        }
+        group.push_back(std::move(*top));
+      }
+      if (group.size() != manifest.size()) {
+        continue;
+      }
+      // All members have distinct real leaves and have passed may_update against this MC parent.
+      // An unexpected write failure aborts the entire MC candidate.
+      for (auto& top : group) {
+        top.descr.write().set_reg_mc_seqno(new_block_seqno);
+        auto updated = shard_conf_->update_shard_block_info(top.descr, top.prev);
+        FAIL_UNLESS(updated.is_ok() && updated.ok());
+        FAIL_UNLESS(store_shard_fees(top.descr));
+        register_shard_block_creators(top.proof->get_creator_list(top.length));
+        shards_max_end_lt_ = std::max(shards_max_end_lt_, top.descr->end_lt_);
+        used_shard_block_descr_.push_back(top.proof);
+        ++tb_act;
+      }
       continue;
     }
-    if (!res.move_as_ok()) {
+    auto top = prepare(sh_bd);
+    if (!top) {
+      continue;
+    }
+    auto descr = std::move(top->descr);
+    auto start_blks = std::move(top->prev);
+    auto chain_len = top->length;
+    auto shard = descr->shard();
+    if (!top->standalone) {
       FAIL_UNLESS(start_blks.size() == 1);
       if (shard_is_sibling(prev_shard, shard)) {
         auto start_blks2 = prev_bd->get_prev_at(prev_chain_len);

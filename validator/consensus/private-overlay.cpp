@@ -42,7 +42,7 @@ class PrivateOverlayImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
     std::vector<td::Bits256> overlay_nodes_tl;
     std::map<PublicKeyHash, td::uint32> authorized_keys;
 
-    td::uint32 max_broadcast_size = bus.config.max_block_size + bus.config.max_collated_data_size + (1 << 20);
+    td::uint32 max_broadcast_size = bus.candidate_size_limit();
     for (const auto& peer : bus.validator_set) {
       adnl_id_to_peer_[peer.adnl_id] = peer;
       broadcast_src_to_peer_[peer.short_id] = peer;
@@ -242,8 +242,9 @@ class PrivateOverlayImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
     auto candidate = maybe_candidate.move_as_ok();
 
     if (!candidate->is_empty()) {
-      const BlockCandidate& block = std::get<BlockCandidate>(candidate->block);
-      td::actor::send_closure(bus.manager, &ManagerFacade::cache_block_candidate, block.clone());
+      for (const auto& block : candidate->blocks()) {
+        td::actor::send_closure(bus.manager, &ManagerFacade::cache_block_candidate, block.clone());
+      }
     }
 
     owning_bus().publish<CandidateReceived>(std::move(candidate));

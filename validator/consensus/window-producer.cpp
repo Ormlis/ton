@@ -6,14 +6,106 @@
 
 #include <cmath>
 
+#include "block/block-auto.h"
 #include "td/actor/SharedFuture.h"
 #include "td/actor/coro_task.h"
 #include "td/actor/coro_utils.h"
+#include "validator/impl/shard-group.h"
 
 #include "stats.h"
 #include "window-producer.h"
 
 namespace ton::validator::consensus {
+
+namespace {
+using ExternalMessages = td::PersistentTreap<td::Bits256, td::Unit>;
+struct GeneratedRound {
+  std::vector<GeneratedCandidate> members;
+  std::vector<td::BufferSlice> encoded_members;
+};
+using GeneratedRoundRef = std::shared_ptr<GeneratedRound>;
+
+struct GeneratedMember {
+  GeneratedCandidate block;
+  td::BufferSlice encoded;
+};
+
+td::actor::Task<GeneratedMember> collate_member(BusHandle bus, CollateParams params, td::CancellationToken token) {
+  auto exchange = params.group_exchange;
+  auto result = co_await td::actor::ask(bus->manager, &ManagerFacade::collate_block, std::move(params), token).wrap();
+  if (result.is_error()) {
+    if (!exchange.empty()) {
+      td::actor::send_closure(exchange, &ShardGroupExchange::cancel);
+    }
+    co_return result.move_as_error();
+  }
+  GeneratedMember member{result.move_as_ok(), {}};
+  if (!exchange.empty()) {
+    co_await td::actor::detach_from_actor();
+    member.encoded = CO_TRY(Candidate::encode_block(member.block.candidate));
+  }
+  co_return std::move(member);
+}
+
+td::actor::Task<GeneratedRoundRef> collate_round(BusHandle bus, ChainStateRef state, CollateParams common,
+                                                 std::vector<ExternalMessages> processed, td::CancellationToken token) {
+  const auto& members = bus->group_members;
+  if (!members.empty()) {
+    common.group_members = members;
+    common.group_message_order = CO_TRY(state->group_message_order());
+    common.group_mc_state = co_await td::actor::ask(bus->manager, &ManagerFacade::group_masterchain_state);
+    auto min_utime = common.group_mc_state->get_unix_time();
+    for (size_t i = 0; i < members.size(); ++i) {
+      block::gen::ShardStateUnsplit::Record prev;
+      if (!tlb::unpack_cell(state->member(i).state().front(), prev)) {
+        co_return td::Status::Error("Invalid previous state in shard group");
+      }
+      min_utime = std::max(min_utime, prev.gen_utime);
+    }
+    common.utime =
+        std::max(common.utime.value(), double(min_utime) + (common.group_mc_state->get_global_version() < 13));
+  }
+  for (int attempt = 0;; ++attempt) {
+    td::actor::ActorOwn<ShardGroupExchange> exchange;
+    if (!members.empty()) {
+      exchange = td::actor::create_actor<ShardGroupExchange>("shard-group-exchange", members.size());
+      common.group_exchange = exchange.get();
+      common.attempt_idx = attempt;
+    }
+    std::vector<td::actor::StartedTask<GeneratedMember>> tasks;
+    for (size_t i = 0; i < processed.size(); ++i) {
+      auto params = common;
+      const auto& member = state->member(i);
+      params.shard = members.empty() ? bus->shard : members[i];
+      params.prev = member.block_ids();
+      params.prev_block_data = member.block_data();
+      params.prev_block_state_roots = member.state();
+      params.processed_external_messages = processed[i];
+      tasks.push_back(collate_member(bus, std::move(params), token).start());
+    }
+    auto result = co_await td::actor::all(std::move(tasks)).wrap();
+    if (result.is_ok()) {
+      auto round = std::make_shared<GeneratedRound>();
+      size_t wire_bytes = 1024;
+      for (auto& member : result.ok_ref()) {
+        round->members.push_back(std::move(member.block));
+        if (!members.empty()) {
+          wire_bytes += member.encoded.size() + 8;
+          round->encoded_members.push_back(std::move(member.encoded));
+        }
+      }
+      if (wire_bytes <= Bus::max_group_candidate_bytes) {
+        co_return round;
+      }
+      result = td::Status::Error("Shard group exceeds the candidate resolution size limit");
+    }
+    if (members.empty() || token || common.hard_timeout.is_in_past() || attempt + 1 >= CollateParams::max_attempts) {
+      co_return result.move_as_error();
+    }
+    LOG(WARNING) << "Retrying collation of the complete shard group: " << result.error();
+  }
+}
+}  // namespace
 
 td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx) {
   auto& bus = *bus_handle;
@@ -21,9 +113,9 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
   ChainStateRef state = ctx.state;
   ParentId parent = ctx.base;
   bool block_generation_active = false;
-  td::actor::SharedFuture<GeneratedCandidate> block_generation;
+  td::actor::SharedFuture<GeneratedRoundRef> block_generation;
   td::uint32 block_generation_target_slot = 0;
-  td::PersistentTreap<td::Bits256, td::Unit> processed_external_messages;
+  std::vector<ExternalMessages> processed_external_messages(std::max<size_t>(1, bus.group_members.size()));
 
   std::chrono::milliseconds hard_timeout = std::max(ctx.target_rate * 3, std::chrono::milliseconds(60'000));
   std::chrono::milliseconds start_collate_before =
@@ -42,19 +134,16 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
       CollateParams params{
           .shard = bus.shard,
           .min_masterchain_block_id = state->min_mc_block_id(),
-          .prev = state->block_ids(),
+          .prev = {},
           .creator = Ed25519_PublicKey{ctx.leader.key.ed25519_value().raw()},
           .first_in_window = slot == ctx.start_slot,
           .utime = slot_start.at_unix(),
           .hard_timeout = slot_start + hard_timeout,
-          .prev_block_data = state->block_data(),
-          .prev_block_state_roots = state->state(),
-          .processed_external_messages = processed_external_messages,
       };
       if (bus.shard.is_masterchain()) {
         params.soft_timeout = slot_start + ctx.target_rate;
       } else {
-        params.soft_timeout = slot_start;
+        params.soft_timeout = bus.group_members.empty() ? slot_start : slot_start + ctx.target_rate;
         params.wait_externals_until = slot_start;
       }
       if (ctx.collator_node_id) {
@@ -65,12 +154,13 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
       // turn is enqueued ahead of the request it is timing.
       auto collate_started = stats::CollateStarted::create(slot, slot_start);
       block_generation =
-          td::actor::ask(bus.manager, &ManagerFacade::collate_block, std::move(params), ctx.cancellation_token);
+          collate_round(bus_handle, state, std::move(params), processed_external_messages, ctx.cancellation_token)
+              .start();
       bus_handle.publish<TraceEvent>(std::move(collate_started));
     }
     co_await td::actor::coro_sleep(slot_start);
 
-    std::optional<GeneratedCandidate> generated_candidate;
+    GeneratedRoundRef generated_candidate;
     std::optional<td::uint32> attempted_collation_target;
     if (block_generation_active) {
       attempted_collation_target = block_generation_target_slot;
@@ -96,15 +186,15 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
         generated_candidate = r_candidate.move_as_ok();
         block_generation_active = false;
       } else if (r_candidate.error().code() == td::actor::AWAIT_TIMEOUT_CODE) {
-        generated_candidate = std::nullopt;
+        generated_candidate.reset();
         LOG(WARNING) << "Generating an empty block for slot " << slot << ": block collation takes too long";
       } else {
-        generated_candidate = std::nullopt;
+        generated_candidate.reset();
         LOG(WARNING) << "Generating an empty block for slot " << slot << ": collation error: " << r_candidate.error();
         block_generation_active = false;
       }
     } else {
-      generated_candidate = std::nullopt;
+      generated_candidate.reset();
       LOG(WARNING) << "Generating an empty block for slot " << slot << ": new_seqno=" << state->next_seqno();
     }
     if (ctx.is_superseded()) {
@@ -112,29 +202,33 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
     }
 
     CandidateId id;
-    std::variant<BlockIdExt, BlockCandidate> block;
-    if (generated_candidate.has_value()) {
+    CandidateContents block;
+    if (generated_candidate) {
       CHECK(attempted_collation_target.has_value());
-      td::actor::send_closure(bus.manager, &ManagerFacade::cache_block_candidate,
-                              generated_candidate->candidate.clone());
-      state = state->apply(generated_candidate->candidate);
-      id = CandidateHashData::create_full(generated_candidate->candidate, parent).build_id_with(slot);
-      double finished_at_monotonic = generated_candidate->collated_at_monotonic;
+      CandidateBlocks blocks;
+      double finished_at_monotonic = 0.0;
+      for (size_t i = 0; i < generated_candidate->members.size(); ++i) {
+        auto& member = generated_candidate->members[i];
+        td::actor::send_closure(bus.manager, &ManagerFacade::cache_block_candidate, member.candidate.clone());
+        processed_external_messages[i] = std::move(member.processed_external_messages);
+        finished_at_monotonic = std::max(finished_at_monotonic, member.collated_at_monotonic);
+        blocks.push_back(std::move(member.candidate));
+      }
+      state = state->apply_blocks(blocks);
+      block = std::move(blocks);
+      id = CandidateHashData::from(block, parent).build_id_with(slot);
       if (!std::isfinite(finished_at_monotonic) || finished_at_monotonic <= 0.0) {
         // Synthetic/test ManagerFacade implementations may still return candidates without the
         // local telemetry field. Preserve correct ordering instead of using the steady-clock
         // epoch; production collators set it before fulfilling the promise.
         finished_at_monotonic = td::Timestamp::now().at();
       }
-      block = std::move(generated_candidate->candidate);
-      processed_external_messages = generated_candidate->processed_external_messages;
       bus_handle.publish<TraceEvent>(
           stats::CollateFinished::create(*attempted_collation_target, slot_start, id, finished_at_monotonic));
     } else {
       CHECK(parent.has_value());
-      auto referenced_block = state->assert_normal();
-      block = referenced_block;
-      id = CandidateHashData::create_empty(referenced_block, *parent).build_id_with(slot);
+      block = state->block_ids();
+      id = CandidateHashData::from(block, parent).build_id_with(slot);
       // Preserve the launch slot even when a carried future changed from timeout to a terminal
       // error above and block_generation_active was cleared before we got here.
       auto target_slot = attempted_collation_target.value_or(slot);
@@ -149,8 +243,12 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
     if (ctx.delegation.has_value()) {
       delegation = ctx.delegation->clone();
     }
+    std::vector<td::BufferSlice> encoded;
+    if (generated_candidate) {
+      encoded = std::move(generated_candidate->encoded_members);
+    }
     auto candidate = td::make_ref<Candidate>(id, parent, ctx.leader.idx, std::move(block), std::move(signature),
-                                             std::move(delegation));
+                                             std::move(delegation), std::move(encoded));
     if (ctx.is_superseded()) {
       break;
     }

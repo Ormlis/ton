@@ -21,7 +21,7 @@ CandidateId candidate_id(td::uint32 slot) {
 }
 
 CandidateRef empty_candidate() {
-  std::variant<BlockIdExt, BlockCandidate> block{BlockIdExt{}};
+  CandidateContents block{BlockReferences{BlockIdExt{}}};
   return td::make_ref<Candidate>(candidate_id(kCandidateSlot), candidate_id(kCandidateSlot - 1), PeerValidatorId{0},
                                  std::move(block), td::BufferSlice{});
 }

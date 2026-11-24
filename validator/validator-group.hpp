@@ -46,6 +46,7 @@ struct GroupIdentity {
 
 struct GroupParams {
   ShardIdFull shard;
+  std::vector<ShardIdFull> members;
   td::actor::ActorId<ValidatorManager> manager;
   td::actor::ActorId<keyring::Keyring> keyring;
   td::Ref<ValidatorManagerOptions> validator_opts;

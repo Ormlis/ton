@@ -9,6 +9,7 @@
 #include "td/utils/format.h"
 #include "ton/ton-io.hpp"
 #include "validator/fabric.h"
+#include "validator/impl/shard-group.h"
 
 #include "chain-state.h"
 
@@ -59,7 +60,53 @@ td::actor::Task<td::Ref<ChainState>> ChainState::from_manager(td::actor::ActorId
   }
 }
 
+td::actor::Task<td::Ref<ChainState>> ChainState::from_group(td::actor::ActorId<ManagerFacade> manager,
+                                                            ShardIdFull shard, std::vector<ShardIdFull> members,
+                                                            std::vector<BlockIdExt> blocks,
+                                                            BlockIdExt min_mc_block_id) {
+  if (members.empty()) {
+    co_return co_await from_manager(manager, shard, std::move(blocks), min_mc_block_id);
+  }
+  if (blocks.size() != members.size()) {
+    co_return td::Status::Error("Incomplete shard group state");
+  }
+  std::vector<td::actor::StartedTask<td::Ref<ChainState>>> tasks;
+  for (size_t i = 0; i < members.size(); ++i) {
+    if (blocks[i].shard_full() != members[i]) {
+      co_return td::Status::Error("Shard group state has an unexpected member");
+    }
+    tasks.push_back(from_manager(manager, members[i], {blocks[i]}, min_mc_block_id).start());
+  }
+  co_return td::make_ref<ChainState>(co_await td::actor::all(std::move(tasks)));
+}
+
+ChainState::ChainState(std::vector<td::Ref<ChainState>> members)
+    : members_(std::move(members))
+    , tip_(members_.front()->tip_)
+    , min_mc_block_id_(members_.front()->min_mc_block_id()) {
+}
+
+td::Ref<ChainState> ChainState::apply_blocks(const std::vector<BlockCandidate>& blocks) const {
+  if (members_.empty()) {
+    CHECK(blocks.size() == 1);
+    return apply(blocks.front());
+  }
+  CHECK(blocks.size() == members_.size());
+  std::vector<td::Ref<ChainState>> next;
+  for (size_t i = 0; i < blocks.size(); ++i) {
+    next.push_back(members_[i]->apply(blocks[i]));
+  }
+  return td::make_ref<ChainState>(std::move(next));
+}
+
 std::vector<BlockIdExt> ChainState::block_ids() const {
+  if (!members_.empty()) {
+    std::vector<BlockIdExt> ids;
+    for (const auto& member : members_) {
+      ids.push_back(member->block_ids().front());
+    }
+    return ids;
+  }
   return std::visit([](const auto& tip) { return tip.block_ids(); }, tip_);
 }
 
@@ -75,11 +122,34 @@ BlockIdExt ChainState::min_mc_block_id() const {
   return min_mc_block_id_;
 }
 
+td::Result<std::shared_ptr<const ShardGroupMessageOrder>> ChainState::group_message_order() const {
+  CHECK(!members_.empty());
+  auto group = members_.front()->block_ids().front().shard_full();
+  for (size_t n = members_.size(); n > 1; n /= 2) {
+    group = shard_parent(group);
+  }
+  auto order = std::make_shared<ShardGroupMessageOrder>();
+  for (const auto& member : members_) {
+    TRY_STATUS(order->add_parent(member->root_, group));
+  }
+  try {
+    order->index_parents();
+  } catch (const vm::VmError& e) {
+    return e.as_status();
+  } catch (const vm::VmVirtError& e) {
+    return e.as_status();
+  }
+  return std::shared_ptr<const ShardGroupMessageOrder>(std::move(order));
+}
+
 BlockSeqno ChainState::next_seqno() const {
   return std::visit([](const auto& tip) { return tip.next_seqno(); }, tip_);
 }
 
 bool ChainState::is_before_split() const {
+  if (!members_.empty()) {
+    return std::any_of(members_.begin(), members_.end(), [](const auto& state) { return state->is_before_split(); });
+  }
   if (auto normal_tip = std::get_if<NormalTip>(&tip_)) {
     block::gen::Block::Record blk;
     block::gen::BlockInfo::Record info;

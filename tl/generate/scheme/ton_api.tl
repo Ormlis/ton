@@ -859,9 +859,13 @@ consensus.candidateParent id:consensus.CandidateId = consensus.CandidateParent;
 consensus.candidateWithoutParents = consensus.CandidateParent;
 
 consensus.candidateHashDataOrdinary block:tonNode.blockIdExt collated_file_hash:int256 parent:consensus.CandidateParent = consensus.CandidateHashData;
+consensus.candidateHashDataGroup blocks:(vector tonNode.blockIdExt) collated_file_hashes:(vector int256) parent:consensus.CandidateParent = consensus.CandidateHashData;
 consensus.candidateHashDataEmpty block:tonNode.blockIdExt parent:consensus.candidateId = consensus.CandidateHashData;
 
 consensus.block slot:int parent:consensus.CandidateParent candidate:bytes signature:bytes = consensus.CandidateData;
+consensus.blockGroup slot:int parent:consensus.CandidateParent candidates:(vector bytes) signature:bytes = consensus.CandidateData;
+consensus.emptyGroup slot:int parent:consensus.candidateId blocks:(vector tonNode.blockIdExt) signature:bytes = consensus.CandidateData;
+validator.shardGroup session:int256 members:(vector long) topology_mc_root:int256 = validator.ShardGroup;
 consensus.empty slot:int parent:consensus.CandidateId block:tonNode.blockIdExt signature:bytes = consensus.CandidateData;
 
 consensus.delegationToSign window_start_slot:int collator_id:int256 = consensus.DelegationToSign;

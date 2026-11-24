@@ -69,6 +69,14 @@ static ton::tl_object_ptr<ton::ton_api::consensus_CandidateHashData> clone_tl(
                     ton::create_tl_block_id(ton::create_block_id(obj.block_)), obj.collated_file_hash_,
                     clone_tl(obj.parent_));
               },
+              [&](const ton::ton_api::consensus_candidateHashDataGroup& obj) {
+                std::vector<ton::tl_object_ptr<ton::ton_api::tonNode_blockIdExt>> ids;
+                for (const auto& id : obj.blocks_) {
+                  ids.push_back(ton::create_tl_block_id(ton::create_block_id(id)));
+                }
+                result = ton::create_tl_object<ton::ton_api::consensus_candidateHashDataGroup>(
+                    std::move(ids), std::vector<td::Bits256>(obj.collated_file_hashes_), clone_tl(obj.parent_));
+              },
               [&](const ton::ton_api::consensus_candidateHashDataEmpty& obj) {
                 result = ton::create_tl_object<ton::ton_api::consensus_candidateHashDataEmpty>(
                     ton::create_tl_block_id(ton::create_block_id(obj.block_)),
@@ -262,16 +270,45 @@ class BlockSignatureSetSimplex : public BlockSignatureSetBase {
     return final_;
   }
 
+  std::vector<ton::BlockIdExt> group_blocks() const override {
+    std::vector<ton::BlockIdExt> ids;
+    if (candidate_->get_id() == ton::ton_api::consensus_candidateHashDataGroup::ID) {
+      const auto& group = static_cast<const ton::ton_api::consensus_candidateHashDataGroup&>(*candidate_);
+      for (const auto& id : group.blocks_) {
+        ids.push_back(ton::create_block_id(id));
+      }
+    }
+    return ids;
+  }
+
   td::Result<td::BufferSlice> to_sign(ton::BlockIdExt block_id) const override {
-    ton::BlockIdExt expected_block_id;
-    ton::ton_api::downcast_call(*candidate_, td::overloaded(
-                                                 [&](const ton::ton_api::consensus_candidateHashDataOrdinary& obj) {
-                                                   expected_block_id = ton::create_block_id(obj.block_);
-                                                 },
-                                                 [&](const ton::ton_api::consensus_candidateHashDataEmpty& obj) {
-                                                   expected_block_id = ton::create_block_id(obj.block_);
-                                                 }));
-    if (block_id != expected_block_id) {
+    bool matches = false;
+    ton::ton_api::downcast_call(
+        *candidate_, td::overloaded(
+                         [&](const ton::ton_api::consensus_candidateHashDataGroup& group) {
+                           if (group.blocks_.size() < 2 || group.blocks_.size() > 8 ||
+                               block_id.id.workchain != ton::basechainId ||
+                               (!group.collated_file_hashes_.empty() &&
+                                group.collated_file_hashes_.size() != group.blocks_.size()) ||
+                               (group.collated_file_hashes_.empty() &&
+                                group.parent_->get_id() != ton::ton_api::consensus_candidateParent::ID)) {
+                             return;
+                           }
+                           auto ids = group_blocks();
+                           auto levels = td::count_trailing_zeroes32(static_cast<td::uint32>(ids.size()));
+                           auto shards = CatchainValidatorsConfig::group_members_at(block_id.shard_full(), levels);
+                           if (ids.size() != shards.size()) {
+                             return;
+                           }
+                           for (size_t i = 0; i < ids.size(); ++i) {
+                             if (!ids[i].is_valid_full() || ids[i].shard_full() != shards[i]) {
+                               return;
+                             }
+                           }
+                           matches = std::find(ids.begin(), ids.end(), block_id) != ids.end();
+                         },
+                         [&](const auto& single) { matches = block_id == ton::create_block_id(single.block_); }));
+    if (!matches) {
       return td::Status::Error("block id mismatch");
     }
     auto candidate_id = ton::create_tl_object<ton::ton_api::consensus_candidateId>(

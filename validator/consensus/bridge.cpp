@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: LGPL-2.0-or-later
  */
 
+#include "td/actor/coro_utils.h"
 #include "td/db/KeyValueAsync.h"
 #include "td/db/RocksDb.h"
 #include "td/utils/port/path.h"
@@ -32,6 +33,10 @@ class ManagerFacadeImpl : public ManagerFacade {
       : manager_(manager), validator_set_(std::move(validator_set)), opts_(std::move(opts)) {
   }
 
+  td::actor::Task<td::Ref<MasterchainState>> group_masterchain_state() override {
+    co_return co_await td::actor::ask(manager_, &ValidatorManager::get_top_masterchain_state);
+  }
+
   td::actor::Task<GeneratedCandidate> collate_block(CollateParams params,
                                                     td::CancellationToken cancellation_token) override {
     params.validator_set = validator_set_;
@@ -50,30 +55,30 @@ class ManagerFacadeImpl : public ManagerFacade {
     co_return co_await std::move(task);
   }
 
-  td::actor::Task<> accept_block(BlockIdExt id, td::Ref<BlockData> data, size_t creator_idx,
-                                 td::Ref<block::BlockSignatureSet> signatures, int finality_broadcast_mode,
-                                 bool apply) override {
-    td::actor::send_closure(manager_, &ValidatorManager::got_block_finality, id, signatures,
-                            BroadcastSource::consensus_overlay, [id](td::Result<> R) {
-                              if (R.is_error()) {
-                                VLOG(validator, WARNING) << "Block finality for " << id << " : " << R.move_as_error();
-                              }
-                            });
-    if (finality_broadcast_mode != 0) {
-      td::actor::send_closure(manager_, &ValidatorManager::send_block_finality_broadcast,
-                              BlockFinalityBroadcast{id, signatures}, finality_broadcast_mode);
+  td::actor::Task<> accept_blocks(std::vector<td::Ref<BlockData>> blocks, size_t creator_idx,
+                                  td::Ref<block::BlockSignatureSet> signatures, int finality_broadcast_mode,
+                                  bool apply) override {
+    std::vector<BlockIdExt> ids;
+    for (const auto& data : blocks) {
+      ids.push_back(data->block_id());
     }
-    while (true) {
-      auto [task, promise] = td::actor::StartedTask<>::make_bridge();
-      run_accept_block_query(id, data, {}, validator_set_, signatures, apply, manager_, std::move(promise));
-      auto result = co_await std::move(task).wrap();
-      if (result.is_ok() || result.error().code() == ErrorCode::cancelled) {
-        break;
-      }
-      LOG_CHECK(result.error().code() == ErrorCode::timeout || result.error().code() == ErrorCode::notready)
-          << "Failed to accept finalized block " << id << " : " << result.error();
-      LOG(WARNING) << "Failed to accept finalized block " << id << ", retrying : " << result.error();
-      co_await td::actor::coro_sleep(td::Timestamp::in(1.0));
+    auto manifest = signatures->group_blocks();
+    if (ids.empty() || (manifest.empty() ? ids.size() != 1 : manifest != ids)) {
+      co_return td::Status::Error("Accepted blocks do not match the certificate");
+    }
+    if (ids.size() == 1) {
+      publish_finality(ids.front(), signatures, finality_broadcast_mode);
+      co_return co_await persist_block(blocks.front(), signatures, apply, false);
+    }
+    // Retrying a partially stored round is idempotent. Publish the shared certificate only
+    // after every member is durable so peers requesting any of its blocks can retrieve it.
+    std::vector<td::actor::StartedTask<>> tasks;
+    for (const auto& data : blocks) {
+      tasks.push_back(persist_block(data, signatures, apply, true).start());
+    }
+    co_await td::actor::all(std::move(tasks));
+    for (const auto& id : ids) {
+      publish_finality(id, signatures, finality_broadcast_mode);
     }
     co_return {};
   }
@@ -117,6 +122,42 @@ class ManagerFacadeImpl : public ManagerFacade {
   }
 
  private:
+  void publish_finality(BlockIdExt id, td::Ref<block::BlockSignatureSet> signatures, int finality_broadcast_mode) {
+    td::actor::send_closure(manager_, &ValidatorManager::got_block_finality, id, signatures,
+                            BroadcastSource::consensus_overlay, [id](td::Result<> R) {
+                              if (R.is_error()) {
+                                VLOG(validator, WARNING) << "Block finality for " << id << " : " << R.move_as_error();
+                              }
+                            });
+    if (finality_broadcast_mode != 0) {
+      td::actor::send_closure(manager_, &ValidatorManager::send_block_finality_broadcast,
+                              BlockFinalityBroadcast{id, signatures}, finality_broadcast_mode);
+    }
+  }
+
+  td::actor::Task<> persist_block(td::Ref<BlockData> data, td::Ref<block::BlockSignatureSet> signatures, bool apply,
+                                  bool grouped) {
+    auto id = data->block_id();
+    while (true) {
+      auto [task, promise] = td::actor::StartedTask<>::make_bridge();
+      run_accept_block_query(id, data, {}, validator_set_, signatures, apply, manager_, std::move(promise));
+      auto result = co_await std::move(task).wrap();
+      if (result.is_ok()) {
+        co_return {};
+      }
+      if (result.error().code() == ErrorCode::cancelled) {
+        if (grouped) {
+          co_return result.move_as_error();
+        }
+        co_return {};
+      }
+      LOG_CHECK(result.error().code() == ErrorCode::timeout || result.error().code() == ErrorCode::notready)
+          << "Failed to accept finalized block " << id << " : " << result.error();
+      LOG(WARNING) << "Failed to accept finalized block " << id << ", retrying : " << result.error();
+      co_await td::actor::coro_sleep(td::Timestamp::in(1.0));
+    }
+  }
+
   td::actor::ActorId<ValidatorManager> manager_;
   td::Ref<block::ValidatorSet> validator_set_;
   td::Ref<ValidatorManagerOptions> opts_;
@@ -214,6 +255,7 @@ class BridgeImpl final : public IValidatorGroup {
     auto bus = std::make_shared<simplex::Bus>();
 
     bus->shard = params_.shard;
+    bus->group_members = params_.members;
     bus->manager = manager_facade_.get();
     bus->keyring = params_.keyring;
     bus->validator_opts.store(params_.validator_opts);
@@ -322,8 +364,9 @@ class BridgeImpl final : public IValidatorGroup {
   td::actor::Task<> resolve_state_and_start(std::vector<BlockIdExt> blocks, BlockIdExt min_mc_block_id) {
     Ref<ChainState> state;
     while (true) {
-      auto r_state =
-          co_await ChainState::from_manager(manager_facade_.get(), params_.shard, blocks, min_mc_block_id).wrap();
+      auto r_state = co_await ChainState::from_group(manager_facade_.get(), params_.shard, params_.members, blocks,
+                                                     min_mc_block_id)
+                         .wrap();
       if (!bus_) {
         co_return td::Status::Error("validator group already destroyed");
       }
