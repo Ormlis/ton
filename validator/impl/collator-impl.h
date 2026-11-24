@@ -223,6 +223,7 @@ class Collator final : public td::actor::Actor {
   td::uint64 out_msg_queue_size_hard_limit_ = std::numeric_limits<td::uint64>::max();
   bool have_out_msg_queue_size_in_state_ = false;
   std::unique_ptr<vm::Dictionary> early_imports_;
+  vm::Dictionary prev_early_imports_{320};
   std::shared_ptr<block::MsgProcessedUptoCollection> processed_upto_, sibling_processed_upto_;
   std::unique_ptr<vm::Dictionary> block_create_stats_;
   std::map<td::Bits256, int> block_create_count_;

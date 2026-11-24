@@ -10,6 +10,16 @@
 
 namespace ton::validator {
 
+bool visit_early_import_receipt(vm::Dictionary& previous_receipts, Ref<vm::Cell> envelope) {
+  td::BitArray<352> queue_key;
+  if (!block::compute_out_msg_queue_key(std::move(envelope), queue_key)) {
+    return false;
+  }
+  // A receipt key is the queue key without the workchain. The lookup also records an absent key's path.
+  previous_receipts.lookup(queue_key.bits() + 32, 320);
+  return true;
+}
+
 td::Status ShardGroupMessageOrder::add_parent(Ref<vm::Cell> state, ShardIdFull group) {
   try {
     block::gen::ShardStateUnsplit::Record shard;

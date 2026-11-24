@@ -1414,6 +1414,9 @@ bool Collator::import_shard_state_data(block::ShardState& ss) {
   old_out_msg_queue_ = std::make_unique<vm::AugmentedDictionary>(*out_msg_queue_);
   processed_upto_ = std::move(ss.processed_upto_);
   early_imports_ = std::move(ss.early_imports_);
+  if (full_collated_data_ && !is_masterchain()) {
+    prev_early_imports_ = *early_imports_;
+  }
   dispatch_queue_ = std::move(ss.dispatch_queue_);
   old_dispatch_queue_ = std::make_unique<vm::AugmentedDictionary>(*dispatch_queue_);
   block_create_stats_ = std::move(ss.block_create_stats_);
@@ -4937,6 +4940,9 @@ bool Collator::insert_in_msg(Ref<vm::Cell> in_msg) {
   int tag = block::gen::t_InMsg.get_tag(cs);
   // msg_import_ext$000 or msg_import_ihr$010 contain (Message Any) directly
   if (!(tag == block::gen::InMsg::msg_import_ext || tag == block::gen::InMsg::msg_import_ihr)) {
+    if (!prev_early_imports_.is_empty() && !visit_early_import_receipt(prev_early_imports_, msg)) {
+      return fatal_error("cannot compute early import receipt key for inbound message");
+    }
     // extract Message Any from MsgEnvelope to compute correct key
     auto cs2 = load_cell_slice(std::move(msg));
     if (!cs2.size_refs()) {

@@ -11,6 +11,9 @@
 
 namespace ton::validator {
 
+// Include the validator's receipt lookup in the proof of the previous state.
+bool visit_early_import_receipt(vm::Dictionary& previous_receipts, Ref<vm::Cell> envelope);
+
 // An idle member can be woken by any sender. All idle mailboxes together end this candidate.
 class ShardGroupExchange final : public td::actor::Actor {
  public:

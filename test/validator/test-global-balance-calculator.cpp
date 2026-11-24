@@ -39,6 +39,8 @@
 #include "validator/global-balance-calculator.hpp"
 #include "validator/impl/global-balance-calculator-internal.hpp"
 #include "validator/impl/shard-group.h"
+#include "vm/boc.h"
+#include "vm/cells/MerkleProof.h"
 #include "vm/cells/MerkleUpdate.h"
 
 namespace ton::validator {
@@ -90,10 +92,11 @@ td::Ref<vm::Cell> make_internal_message(td::uint64 src_prefix, td::uint64 dest_p
   return cb.finalize();
 }
 
-td::Ref<vm::Cell> make_envelope(td::Ref<vm::Cell> msg, long long fwd_fee_remaining) {
+td::Ref<vm::Cell> make_envelope(td::Ref<vm::Cell> msg, long long fwd_fee_remaining, int cur_addr = 0) {
   td::Ref<vm::Cell> result;
   CHECK(block::tlb::t_MsgEnvelope.pack_cell(
-      result, block::tlb::MsgEnvelope::Record_std{0, 96, td::make_refint(fwd_fee_remaining), std::move(msg), {}, {}}));
+      result,
+      block::tlb::MsgEnvelope::Record_std{cur_addr, 96, td::make_refint(fwd_fee_remaining), std::move(msg), {}, {}}));
   return result;
 }
 
@@ -515,6 +518,40 @@ TEST(GlobalBalanceCalculator, EarlyReceiptFollowsQueueOnSplit) {
   CHECK(left.early_imports_->lookup(key).not_null() && right.early_imports_->is_empty());
   left.merge_with(right).ensure();
   CHECK(left.early_imports_->lookup_delete(key)->prefetch_ulong(64) == 51 && left.early_imports_->is_empty());
+}
+
+TEST(ShardGroups, ImmediateMessageReceiptProof) {
+  const AccountIdPrefixFull local{basechainId, 0x2000000000000000ULL};
+  const AccountIdPrefixFull peer_dest{basechainId, 0x4000000000000000ULL};
+  auto immediate = make_internal_message(local.account_id_prefix, local.account_id_prefix, 100, 0, 3, 51);
+  auto imported = make_internal_message(0x9000000000000000ULL, peer_dest.account_id_prefix, 100, 0, 3, 52);
+  auto immediate_key = block::early_import_key(local, immediate->get_hash().bits());
+  auto imported_key = block::early_import_key(peer_dest, imported->get_hash().bits());
+  vm::Dictionary parent{320};
+  vm::CellBuilder old_receipt;
+  old_receipt.store_long(50, 64);
+  for (auto hop : {local, peer_dest}) {
+    CHECK(parent.set_builder(block::early_import_key(hop, td::Bits256::zero().bits()), old_receipt));
+  }
+
+  vm::MerkleProofBuilder builder(parent.get_root_cell());
+  vm::ProofStorageStat loaded;
+  builder.set_cell_load_callback([&](const vm::LoadedCell& cell) {
+    loaded.add_loaded_cell(cell.data_cell, static_cast<td::uint8>(cell.effective_level));
+  });
+  vm::Dictionary previous(builder.root(), 320);
+  auto current = previous;
+  vm::CellBuilder new_receipt;
+  new_receipt.store_long(53, 64);
+  CHECK(current.set_builder(imported_key, new_receipt, vm::Dictionary::SetMode::Add));
+  CHECK(visit_early_import_receipt(previous, make_envelope(immediate, 3, 96)));
+
+  auto prune = [&](const Ref<vm::Cell>& cell) { return !loaded.is_loaded(cell->get_hash()); };
+  auto proof = vm::MerkleProof::generate(parent.get_root_cell(), prune).move_as_ok();
+  vm::Dictionary verified(vm::MerkleProof::virtualize(std::move(proof)).move_as_ok(), 320);
+  CHECK(verified.lookup(immediate_key).is_null());
+  CHECK(verified.set_builder(imported_key, new_receipt, vm::Dictionary::SetMode::Add));
+  CHECK(verified.get_root_cell()->get_hash() == current.get_root_cell()->get_hash());
 }
 
 TEST(GlobalBalanceCalculator, FetchSplit) {
