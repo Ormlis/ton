@@ -211,6 +211,7 @@ class Collator final : public td::actor::Actor {
   std::map<AccountIdPrefixFull, LogicalTime> group_last_import_lt_;
   ShardGroupMessageOrder group_message_order_;
   td::actor::Task<> process_group_messages();
+  bool process_group_outputs();
   size_t new_msgs_from_dispatch = 0;
   std::pair<ton::LogicalTime, ton::Bits256> last_proc_int_msg_, first_unproc_int_msg_;
   block::tlb::Aug_InMsgDescr aug_InMsgDescr{0};
@@ -368,8 +369,7 @@ class Collator final : public td::actor::Actor {
   bool precheck_inbound_message(Ref<vm::CellSlice> msg, ton::LogicalTime lt);
   bool process_inbound_message(Ref<vm::CellSlice> msg, ton::LogicalTime lt, td::ConstBitPtr key, int src_nb_idx);
   td::actor::Task<> process_external_and_new_messages();
-  td::actor::Task<bool> process_inbound_external_messages(size_t limit = std::numeric_limits<size_t>::max(),
-                                                          LogicalTime after_lt = 0);
+  td::actor::Task<> process_inbound_external_messages(LogicalTime after_lt = 0, td::CancellationToken interrupt = {});
   int process_external_message(Ref<vm::Cell> msg, LogicalTime after_lt);
   bool process_dispatch_queue();
   bool process_deferred_message(Ref<vm::CellSlice> enq_msg, StdSmcAddress src_addr, LogicalTime lt,

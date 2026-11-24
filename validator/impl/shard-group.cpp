@@ -170,13 +170,14 @@ bool ShardGroupMessageOrder::record(const Route& route, LogicalTime lt, bool dir
 }
 
 void ShardGroupExchange::external_queue_ready(ShardIdFull member, bool closed) {
-  if (external_deadline_) {
-    auto& state = members_[member];
-    state.readable = true;
-    state.closed |= closed;
-    if (state.waiter) {
-      dispatch();
-    }
+  auto& state = members_[member];
+  if (state.finished || state.closed) {
+    return;
+  }
+  state.readable = true;
+  state.closed = closed;
+  if (state.waiter) {
+    dispatch();
   }
 }
 
@@ -186,16 +187,22 @@ void ShardGroupExchange::offer(Transfer transfer) {
     return;
   }
   destination.inbox.push_back(std::move(transfer));
+  if (destination.reading_externals) {
+    // The reader may already hold an item. Resume it even if the queue has since closed.
+    destination.readable = true;
+    destination.interrupt_externals.cancel();
+  }
   if (destination.waiter) {
     dispatch();
   }
 }
 
-void ShardGroupExchange::wait_for_work(ShardIdFull member, bool accept_transfers, Externals externals,
+void ShardGroupExchange::wait_for_work(ShardIdFull member, bool accept_transfers, bool accept_externals,
                                        td::Promise<Work> promise) {
   auto& state = members_[member];
+  state.reading_externals = false;
   state.waiter = std::move(promise);
-  state.externals = externals;
+  state.accept_externals = accept_externals;
   state.accept_transfers = accept_transfers;
   if (!accept_transfers) {
     state.inbox.clear();
@@ -205,32 +212,34 @@ void ShardGroupExchange::wait_for_work(ShardIdFull member, bool accept_transfers
 
 void ShardGroupExchange::dispatch() {
   external_wait_.pause();
-  if (external_deadline_ && external_deadline_.is_in_past()) {
-    external_deadline_ = {};
-  }
+  bool past_cutoff = external_deadline_ && external_deadline_.is_in_past();
   size_t idle = 0;
   bool waiting_for_externals = false;
   for (auto& [_, state] : members_) {
     if (state.finished) {
       ++idle;
     } else if (state.waiter) {
-      if (state.externals == Externals::wait && !external_deadline_ && !state.closed) {
+      if (past_cutoff && !state.closed) {
         // One final read covers notifications in flight at the cutoff.
         state.closed = true;
         state.readable = true;
       }
-      bool read = state.externals == Externals::ready || (state.externals == Externals::wait && state.readable);
-      if (read || !state.inbox.empty()) {
+      if (!state.inbox.empty()) {
+        state.waiter.set_value({std::exchange(state.inbox, {}), {}});
+        continue;
+      }
+      if (state.accept_externals && state.readable) {
         state.readable = false;
-        state.waiter.set_value({std::exchange(state.inbox, {}), read});
+        state.reading_externals = true;
+        state.waiter.set_value({{}, state.interrupt_externals.get_cancellation_token()});
         continue;
       }
       ++idle;
-      if (state.externals == Externals::wait && external_deadline_ && !state.closed) {
+      if (state.accept_externals && !state.closed) {
         waiting_for_externals = true;
       } else if (!state.accept_transfers) {
         state.finished = true;
-        state.waiter.set_value({{}, false, external_wait_.elapsed()});
+        state.waiter.set_value({{}, {}, external_wait_.elapsed()});
       }
     }
   }
@@ -244,12 +253,13 @@ void ShardGroupExchange::dispatch() {
   }
   for (auto& [_, state] : members_) {
     state.finished = true;
-    state.waiter.set_value({{}, false, external_wait_.elapsed()});
+    state.waiter.set_value({{}, {}, external_wait_.elapsed()});
   }
 }
 
 void ShardGroupExchange::cancel() {
   for (auto& [_, state] : members_) {
+    state.interrupt_externals.cancel();
     state.waiter.set_error(td::Status::Error(ErrorCode::cancelled, "Shard group collation cancelled"));
   }
   stop();

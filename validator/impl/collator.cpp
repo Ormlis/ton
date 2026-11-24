@@ -241,9 +241,9 @@ void Collator::start_up() {
   if (!params_.is_hardfork) {
     LOG(DEBUG) << "installing external message queue";
     std::function<void(bool)> on_readable;
-    if (!params_.group_exchange.empty() && params_.wait_externals_until) {
+    if (!params_.group_exchange.empty()) {
       on_readable = [exchange = params_.group_exchange, shard = shard_](bool closed) {
-        td::actor::send_closure(exchange, &ShardGroupExchange::external_queue_ready, shard, closed);
+        td::actor::send_closure_later(exchange, &ShardGroupExchange::external_queue_ready, shard, closed);
       };
     }
     ext_msg_queue_ = ExtMsgQueue("ext_msg_queue", 500, std::move(on_readable));
@@ -3963,37 +3963,43 @@ int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, R
   return 1;
 }
 
+bool Collator::process_group_outputs() {
+  td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.process_new_msgs};
+  bool enqueue_only = !inbound_queues_empty_;
+  return process_new_messages(enqueue_only);
+}
+
 td::actor::Task<> Collator::process_group_messages() {
+  td::ScopedRealCpuTimer::Guard timer_total{work_timer_total_, &stats_.work_time.total};
   std::set<ShardGroupMessageOrder::Route> declined;
   auto can_execute = [&] {
     return !block_full_ && inbound_queues_empty_ && !have_unprocessed_account_dispatch_queue_ &&
            block_limit_status_->fits(block::ParamLimits::cl_normal) && !internal_msg_timeout_.is_in_past();
   };
-  using Externals = ShardGroupExchange::Externals;
-  // Revisit peer and local messages even when the live external queue stays full.
-  constexpr size_t max_live_externals_per_pass = 32;
-  auto external_limit = params_.wait_externals_until ? max_live_externals_per_pass : std::numeric_limits<size_t>::max();
-  bool read_externals = true;
   LogicalTime external_floor = 0;
   while (true) {
-    bool more_externals = read_externals && co_await process_inbound_external_messages(external_limit, external_floor);
-    bool enqueue_only = !can_execute();
-    if (!process_new_messages(enqueue_only)) {
+    if (!new_msgs.empty() && !process_group_outputs()) {
       co_return td::Status::Error("Cannot process shard group outputs");
     }
-    auto externals = Externals::done;
-    if (params_.wait_externals_until && !params_.is_hardfork && !skip_extmsg_ && params_.attempt_idx < 2 &&
-        block_limit_status_->fits(block::ParamLimits::cl_soft) && !external_msg_timeout_.is_in_past()) {
-      externals = more_externals ? Externals::ready : Externals::wait;
+    bool accept_externals = !params_.is_hardfork && !skip_extmsg_ && params_.attempt_idx < 2 &&
+                            block_limit_status_->fits(block::ParamLimits::cl_soft) &&
+                            !external_msg_timeout_.is_in_past();
+    ShardGroupExchange::Work work;
+    {
+      td::ScopedRealCpuTimer::Guard timer{work_timer_total_, nullptr};
+      work = co_await td::actor::ask(params_.group_exchange, &ShardGroupExchange::wait_for_work, shard_, can_execute(),
+                                     accept_externals);
     }
-    auto work = co_await td::actor::ask(params_.group_exchange, &ShardGroupExchange::wait_for_work, shard_,
-                                        can_execute(), externals);
+    if (work.external_reader) {
+      co_await process_inbound_external_messages(external_floor, std::move(*work.external_reader));
+      continue;
+    }
     auto& inbox = work.transfers;
-    read_externals = work.read_externals;
-    if (inbox.empty() && !read_externals) {
+    if (inbox.empty()) {
       wait_externals_total_time_ += work.wait_externals_time;
       co_return td::Unit{};
     }
+    td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.import_internals};
     std::sort(inbox.begin(), inbox.end(), [](const auto& a, const auto& b) {
       return a.lt != b.lt ? a.lt < b.lt : a.envelope->get_hash() < b.envelope->get_hash();
     });
@@ -4532,11 +4538,9 @@ td::actor::Task<> Collator::process_external_and_new_messages() {
 
 /**
  * Processes inbound external messages.
- * Messages are processed until the medium limit is reached, medium timeout is reached or there are no more messages.
- *
- * @returns True if the batch limit was reached and the queue may contain more messages.
+ * In a group, yield to ready peer transfers between external transactions.
  */
-td::actor::Task<bool> Collator::process_inbound_external_messages(size_t limit, LogicalTime after_lt) {
+td::actor::Task<> Collator::process_inbound_external_messages(LogicalTime after_lt, td::CancellationToken interrupt) {
   // Existing per-message total timers exclude queue waits, so their delta is this phase's active work.
   td::ScopedRealCpuTimer::Guard timer_total{work_timer_total_, &stats_.work_time.total};
   td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.import_externals};
@@ -4545,14 +4549,15 @@ td::actor::Task<bool> Collator::process_inbound_external_messages(size_t limit, 
   };
   if (skip_extmsg_ || params_.is_hardfork) {
     LOG(INFO) << "skipping processing of inbound external messages";
-    co_return false;
+    co_return {};
   }
   if (params_.attempt_idx >= 2) {
     LOG(INFO) << "Attempt #" << params_.attempt_idx << ": skip external messages (attempt >= 2)";
-    co_return false;
+    co_return {};
   }
   bool full = !block_limit_status_->fits(block::ParamLimits::cl_soft);
-  while (limit > 0) {
+  bool grouped = !params_.group_exchange.empty();
+  while (!interrupt) {
     if (full) {
       LOG(INFO) << "BLOCK FULL, stop processing external messages";
       stats_.limits_log += PSTRING() << "INBOUND_EXT_MESSAGES: "
@@ -4567,16 +4572,12 @@ td::actor::Task<bool> Collator::process_inbound_external_messages(size_t limit, 
     if (!check_cancelled()) {
       co_return td::Status::Error("Cannot process inbound external messages: collation cancelled");
     }
-    std::pair<td::Ref<ExtMessage>, int> item;
-    if (pending_ext_msg_) {
-      item = std::move(*pending_ext_msg_);
-      pending_ext_msg_.reset();
-    } else {
+    if (!pending_ext_msg_) {
       td::ScopedRealCpuTimer::Guard timer_total{work_timer_total_, nullptr};
       td::ScopedRealCpuTimer::Guard timer{work_timer_, nullptr};
       td::Result<std::pair<td::Ref<ExtMessage>, int>> maybe;
       td::Timer wait_timer;
-      if (params_.wait_externals_until) {
+      if (grouped || params_.wait_externals_until) {
         maybe = co_await ext_msg_queue_.try_pop().wrap();
       } else {
         // In this case queue is closed after pushing the first batch of messages
@@ -4586,10 +4587,14 @@ td::actor::Task<bool> Collator::process_inbound_external_messages(size_t limit, 
       if (maybe.is_error()) {
         break;  // queue empty or closed
       }
-      item = maybe.move_as_ok();
+      pending_ext_msg_ = maybe.move_as_ok();
     }
-    --limit;
-    auto [ext_msg_ref, priority] = std::move(item);
+    // A peer may have arrived during the pop. Keep this item until the next external read.
+    if (interrupt) {
+      break;
+    }
+    auto [ext_msg_ref, priority] = std::move(*pending_ext_msg_);
+    pending_ext_msg_.reset();
     ++stats_.ext_msgs_total;
     if (out_msg_queue_size_ > SKIP_EXTERNALS_QUEUE_SIZE && priority < HIGH_PRIORITY_EXTERNAL) {
       ++stats_.ext_msgs_skipped_backpressure;
@@ -4611,26 +4616,25 @@ td::actor::Task<bool> Collator::process_inbound_external_messages(size_t limit, 
       // Leave this message eligible for the next block and close this member's external intake.
       processed_external_messages_ = processed_external_messages_.erase(ext_msg_ref->hash_norm());
       skip_extmsg_ = true;
-      co_return false;
+      co_return {};
     }
-    if (r > 0) {
-      ++stats_.ext_msgs_accepted;
-    } else {
+    if (r <= 0) {
       ++stats_.ext_msgs_rejected;
-    }
-    if (r < 0) {
       bad_ext_msgs_.emplace_back(ext_msg_ref->hash_norm());
-      co_return td::Status::Error("Cannot process inbound external message");
+      if (r < 0) {
+        co_return td::Status::Error("Cannot process inbound external message");
+      }
+      continue;
     }
-    if (r == 0) {
-      bad_ext_msgs_.emplace_back(ext_msg_ref->hash_norm());
+    ++stats_.ext_msgs_accepted;
+    // Publish outputs to peers even when the external queue stays readable.
+    if (grouped && !new_msgs.empty() && !process_group_outputs()) {
+      co_return td::Status::Error("Cannot process shard group outputs");
     }
-    if (r > 0) {
-      full = !block_limit_status_->fits(block::ParamLimits::cl_soft);
-      block_limit_class_ = std::max(block_limit_class_, block_limit_status_->classify());
-    }
+    full = !block_limit_status_->fits(block::ParamLimits::cl_soft);
+    block_limit_class_ = std::max(block_limit_class_, block_limit_status_->classify());
   }
-  co_return limit == 0;
+  co_return {};
 }
 
 /**

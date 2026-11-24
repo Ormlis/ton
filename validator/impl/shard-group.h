@@ -5,8 +5,10 @@
 #pragma once
 
 #include <map>
+#include <optional>
 #include <set>
 
+#include "td/utils/CancellationToken.h"
 #include "td/utils/Timer.h"
 #include "validator/fabric.h"
 
@@ -24,10 +26,10 @@ class ShardGroupExchange final : public td::actor::Actor {
     Ref<vm::Cell> envelope;
   };
   using Transfers = std::vector<Transfer>;
-  enum class Externals { done, wait, ready };
   struct Work {
     Transfers transfers;
-    bool read_externals = false;
+    // Present when the external queue can be drained. A peer offer interrupts the drain.
+    std::optional<td::CancellationToken> external_reader;
     double wait_externals_time = 0;  // Total time all members were idle, returned on completion.
   };
 
@@ -36,21 +38,23 @@ class ShardGroupExchange final : public td::actor::Actor {
   }
   void external_queue_ready(ShardIdFull member, bool closed);
   void offer(Transfer transfer);
-  void wait_for_work(ShardIdFull member, bool accept_transfers, Externals externals, td::Promise<Work> promise);
+  void wait_for_work(ShardIdFull member, bool accept_transfers, bool accept_externals, td::Promise<Work> promise);
   void cancel();
 
  private:
   struct Member {
     Transfers inbox;
     td::Promise<Work> waiter;
-    Externals externals = Externals::done;
+    td::CancellationTokenSource interrupt_externals;
+    bool reading_externals = false;
+    bool accept_externals = false;
     bool accept_transfers = true;
     bool readable = false;
     bool closed = false;
     bool finished = false;
   };
   size_t size_;
-  td::Timestamp external_deadline_;
+  const td::Timestamp external_deadline_;
   td::Timer external_wait_{true};
   std::map<ShardIdFull, Member> members_;
   void dispatch();

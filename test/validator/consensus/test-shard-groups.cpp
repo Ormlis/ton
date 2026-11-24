@@ -61,46 +61,73 @@ TEST(ShardGroups, QueuedTransfersKeepTheirOrder) {
 
 TEST(ShardGroups, LateExternalWakesAnIdleGroup) {
   using Exchange = ShardGroupExchange;
-  using Externals = Exchange::Externals;
   td::actor::TestScheduler scheduler;
   scheduler.run([&]() -> td::actor::Task<> {
     auto sender = shard_child(ShardIdFull{basechainId}, true), receiver = shard_sibling(sender);
     auto cutoff = td::Timestamp::in(1);
     auto exchange = td::actor::create_actor<Exchange>("exchange", 2, cutoff);
     td::actor::BackpressureQueue<int> inputs("externals", 1, [id = exchange.get(), sender](bool closed) {
-      td::actor::send_closure(id, &Exchange::external_queue_ready, sender, closed);
+      td::actor::send_closure_later(id, &Exchange::external_queue_ready, sender, closed);
     });
-    auto next = [&](ShardIdFull shard, Externals ext) {
-      return td::actor::ask(exchange, &Exchange::wait_for_work, shard, true, ext);
+    auto next = [&](ShardIdFull shard) {
+      return td::actor::ask(exchange, &Exchange::wait_for_work, shard, true, shard == sender);
     };
     auto offer = [&](LogicalTime lt) {
       td::actor::send_closure_later(exchange, &Exchange::offer, Exchange::Transfer{receiver, lt, {}});
     };
-    auto a = next(sender, Externals::wait), b = next(receiver, Externals::done);
+    auto a = next(sender), b = next(receiver);
     co_await scheduler.wait_sync_work();
     ASSERT_TRUE(!a.await_ready() && !b.await_ready());
     ASSERT_TRUE(co_await inputs.push(42));
-    ASSERT_TRUE((co_await std::move(a)).read_externals);
+    ASSERT_TRUE((co_await std::move(a)).external_reader.has_value());
     ASSERT_EQ(42, co_await inputs.try_pop());
     offer(123);
     ASSERT_EQ(123u, (co_await std::move(b)).transfers.at(0).lt);
     offer(124);
     offer(125);
-    auto pending = co_await next(receiver, Externals::done);
+    auto pending = co_await next(receiver);
     ASSERT_EQ(2u, pending.transfers.size());
     ASSERT_EQ(124u, pending.transfers[0].lt);
     ASSERT_EQ(125u, pending.transfers[1].lt);
-    a = next(sender, Externals::wait);
-    b = next(receiver, Externals::done);
+    a = next(sender);
+    b = next(receiver);
     co_await scheduler.wait_sync_work();
     ASSERT_TRUE(!a.await_ready() && !b.await_ready());
     scheduler.advance_time_to(cutoff);
-    ASSERT_TRUE((co_await std::move(a)).read_externals);
+    ASSERT_TRUE((co_await std::move(a)).external_reader.has_value());
     ASSERT_TRUE(co_await inputs.push(43));
-    auto last = co_await next(sender, Externals::wait);
-    ASSERT_TRUE(!last.read_externals && last.transfers.empty());
+    auto last = co_await next(sender);
+    ASSERT_TRUE(!last.external_reader && last.transfers.empty());
     ASSERT_EQ(1.0, last.wait_externals_time);
     ASSERT_TRUE((co_await std::move(b)).transfers.empty());
+    co_return td::Unit{};
+  });
+}
+
+TEST(ShardGroups, PeerPreemptsBufferedExternals) {
+  using Exchange = ShardGroupExchange;
+  td::actor::TestScheduler scheduler;
+  scheduler.run([&]() -> td::actor::Task<> {
+    ShardIdFull receiver{basechainId};
+    auto exchange = td::actor::create_actor<Exchange>("exchange", 1);
+    auto next = [&] { return td::actor::ask(exchange, &Exchange::wait_for_work, receiver, true, true); };
+    auto offer = [&](LogicalTime lt) {
+      td::actor::send_closure_later(exchange, &Exchange::offer, Exchange::Transfer{receiver, lt, {}});
+    };
+    td::actor::send_closure_later(exchange, &Exchange::external_queue_ready, receiver, true);
+    offer(1);
+    auto first = co_await next();
+    ASSERT_TRUE(!first.external_reader && first.transfers.at(0).lt == 1);
+    auto reading = co_await next();
+    ASSERT_TRUE(reading.external_reader && !*reading.external_reader);
+    offer(2);
+    co_await scheduler.wait_sync_work();
+    ASSERT_TRUE(*reading.external_reader);
+    ASSERT_EQ(2u, (co_await next()).transfers.at(0).lt);
+    auto resumed = co_await next();
+    ASSERT_TRUE(resumed.external_reader && !*resumed.external_reader);
+    auto end = co_await next();
+    ASSERT_TRUE(!end.external_reader && end.transfers.empty());
     co_return td::Unit{};
   });
 }
