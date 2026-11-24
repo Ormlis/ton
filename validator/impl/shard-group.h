@@ -7,6 +7,7 @@
 #include <map>
 #include <set>
 
+#include "td/utils/Timer.h"
 #include "validator/fabric.h"
 
 namespace ton::validator {
@@ -14,7 +15,7 @@ namespace ton::validator {
 // Include the validator's receipt lookup in the proof of the previous state.
 bool visit_early_import_receipt(vm::Dictionary& previous_receipts, Ref<vm::Cell> envelope);
 
-// An idle member can be woken by any sender. All idle mailboxes together end this candidate.
+// Idle members can receive peer transfers while any member still has an open external input.
 class ShardGroupExchange final : public td::actor::Actor {
  public:
   struct Transfer {
@@ -23,18 +24,40 @@ class ShardGroupExchange final : public td::actor::Actor {
     Ref<vm::Cell> envelope;
   };
   using Transfers = std::vector<Transfer>;
+  enum class Externals { done, wait, ready };
+  struct Work {
+    Transfers transfers;
+    bool read_externals = false;
+    double wait_externals_time = 0;  // Total time all members were idle, returned on completion.
+  };
 
-  explicit ShardGroupExchange(size_t size) : size_(size) {
+  explicit ShardGroupExchange(size_t size, td::Timestamp external_deadline = {})
+      : size_(size), external_deadline_(external_deadline) {
   }
+  void external_queue_ready(ShardIdFull member, bool closed);
   void publish(Transfers outgoing);
-  void exchange(ShardIdFull member, Transfers outgoing, bool finished, td::Promise<Transfers> promise);
+  void exchange(ShardIdFull member, Transfers outgoing, bool accept_transfers, Externals externals,
+                td::Promise<Work> promise);
   void cancel();
 
  private:
+  struct Member {
+    Transfers inbox;
+    td::Promise<Work> waiter;
+    Externals externals = Externals::done;
+    bool accept_transfers = true;
+    bool readable = false;
+    bool closed = false;
+    bool finished = false;
+  };
   size_t size_;
-  std::set<ShardIdFull> finished_;
-  std::map<ShardIdFull, td::Promise<Transfers>> waiting_;
-  std::map<ShardIdFull, Transfers> incoming_;
+  td::Timestamp external_deadline_;
+  td::Timer external_wait_{true};
+  std::map<ShardIdFull, Member> members_;
+  void dispatch();
+  void alarm() override {
+    dispatch();
+  }
 };
 
 // A direct message must not pass an older ordinary message for the same source and destination.

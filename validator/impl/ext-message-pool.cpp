@@ -549,8 +549,9 @@ metrics::ExtMessageAdmissionOutcome ExtMessagePool::add_message_to_mempool(td::R
   ext_message_states_.insert();
   expiry_order_.relax_alarm(alarm);
   LOG(INFO) << "adding message addr=" << wc << ":" << addr.to_hex() << " prio=" << priority << " to mempool";
+  auto now = td::Timestamp::now();
   std::erase_if(callbacks_, [&](const std::unique_ptr<ExtMsgCallback> &callback) -> bool {
-    if (callback->cancellation_token.check().is_error()) {
+    if (callback->cancellation_token.check().is_error() || (callback->timeout && callback->timeout.is_in_past(now))) {
       return true;
     }
     if (shard_contains(callback->shard, message->shard())) {

@@ -17,6 +17,7 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
+#include <limits>
 #include <map>
 #include <queue>
 
@@ -323,7 +324,8 @@ class Collator final : public td::actor::Actor {
   bool create_ticktock_transactions(int mask);
   bool create_ticktock_transaction(const ton::StdSmcAddress& smc_addr, ton::LogicalTime req_start_lt, int mask);
   Ref<vm::Cell> create_ordinary_transaction(Ref<vm::Cell> msg_root, td::optional<block::MsgMetadata> msg_metadata,
-                                            LogicalTime after_lt, bool is_special_tx = false);
+                                            LogicalTime after_lt, bool is_special_tx = false,
+                                            bool* exceeds_lt_limit = nullptr);
   bool check_cur_validator_set();
   bool unpack_last_mc_state();
   bool unpack_last_state();
@@ -367,8 +369,9 @@ class Collator final : public td::actor::Actor {
   bool precheck_inbound_message(Ref<vm::CellSlice> msg, ton::LogicalTime lt);
   bool process_inbound_message(Ref<vm::CellSlice> msg, ton::LogicalTime lt, td::ConstBitPtr key, int src_nb_idx);
   td::actor::Task<> process_external_and_new_messages();
-  td::actor::Task<bool> process_inbound_external_messages();
-  int process_external_message(Ref<vm::Cell> msg);
+  td::actor::Task<bool> process_inbound_external_messages(size_t limit = std::numeric_limits<size_t>::max(),
+                                                          LogicalTime after_lt = 0);
+  int process_external_message(Ref<vm::Cell> msg, LogicalTime after_lt);
   bool process_dispatch_queue();
   bool process_deferred_message(Ref<vm::CellSlice> enq_msg, StdSmcAddress src_addr, LogicalTime lt,
                                 td::optional<block::MsgMetadata>& msg_metadata);

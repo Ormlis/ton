@@ -169,44 +169,87 @@ bool ShardGroupMessageOrder::record(const Route& route, LogicalTime lt, bool dir
   return times.last_direct == 0 || times.last_direct <= times.first_queued;
 }
 
-void ShardGroupExchange::publish(Transfers outgoing) {
-  for (auto& transfer : outgoing) {
-    if (!finished_.contains(transfer.destination)) {
-      incoming_[transfer.destination].push_back(std::move(transfer));
-    }
-  }
-  for (auto it = waiting_.begin(); it != waiting_.end();) {
-    auto inbox = incoming_.extract(it->first);
-    if (inbox.empty()) {
-      ++it;
-    } else {
-      it->second.set_value(std::move(inbox.mapped()));
-      it = waiting_.erase(it);
+void ShardGroupExchange::external_queue_ready(ShardIdFull member, bool closed) {
+  if (external_deadline_) {
+    auto& state = members_[member];
+    state.readable = true;
+    state.closed |= closed;
+    if (state.waiter) {
+      dispatch();
     }
   }
 }
 
-void ShardGroupExchange::exchange(ShardIdFull member, Transfers outgoing, bool finished,
-                                  td::Promise<Transfers> promise) {
-  if (finished) {
-    finished_.insert(member);
-    incoming_.erase(member);
-    promise.set_value({});
-  } else {
-    waiting_.emplace(member, std::move(promise));
+void ShardGroupExchange::publish(Transfers outgoing) {
+  for (auto& transfer : outgoing) {
+    auto& destination = members_[transfer.destination];
+    if (destination.accept_transfers && !destination.finished) {
+      destination.inbox.push_back(std::move(transfer));
+    }
+  }
+  dispatch();
+}
+
+void ShardGroupExchange::exchange(ShardIdFull member, Transfers outgoing, bool accept_transfers, Externals externals,
+                                  td::Promise<Work> promise) {
+  auto& state = members_[member];
+  state.waiter = std::move(promise);
+  state.externals = externals;
+  state.accept_transfers = accept_transfers;
+  if (!accept_transfers) {
+    state.inbox.clear();
   }
   publish(std::move(outgoing));
-  if (finished_.size() + waiting_.size() == size_) {
-    for (auto& [_, waiter] : waiting_) {
-      waiter.set_value({});
+}
+
+void ShardGroupExchange::dispatch() {
+  external_wait_.pause();
+  if (external_deadline_ && external_deadline_.is_in_past()) {
+    external_deadline_ = {};
+  }
+  size_t idle = 0;
+  bool waiting_for_externals = false;
+  for (auto& [_, state] : members_) {
+    if (state.finished) {
+      ++idle;
+    } else if (state.waiter) {
+      if (state.externals == Externals::wait && !external_deadline_ && !state.closed) {
+        // One final read covers notifications in flight at the cutoff.
+        state.closed = true;
+        state.readable = true;
+      }
+      bool read = state.externals == Externals::ready || (state.externals == Externals::wait && state.readable);
+      if (read || !state.inbox.empty()) {
+        state.readable = false;
+        state.waiter.set_value({std::exchange(state.inbox, {}), read});
+        continue;
+      }
+      ++idle;
+      if (state.externals == Externals::wait && external_deadline_ && !state.closed) {
+        waiting_for_externals = true;
+      } else if (!state.accept_transfers) {
+        state.finished = true;
+        state.waiter.set_value({{}, false, external_wait_.elapsed()});
+      }
     }
-    waiting_.clear();
+  }
+  if (idle != size_) {
+    return;
+  }
+  if (waiting_for_externals) {
+    external_wait_.resume();
+    alarm_timestamp().relax(external_deadline_);
+    return;
+  }
+  for (auto& [_, state] : members_) {
+    state.finished = true;
+    state.waiter.set_value({{}, false, external_wait_.elapsed()});
   }
 }
 
 void ShardGroupExchange::cancel() {
-  for (auto& [_, waiter] : waiting_) {
-    waiter.set_error(td::Status::Error(ErrorCode::cancelled, "Shard group collation cancelled"));
+  for (auto& [_, state] : members_) {
+    state.waiter.set_error(td::Status::Error(ErrorCode::cancelled, "Shard group collation cancelled"));
   }
   stop();
 }

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <queue>
 
@@ -18,7 +19,9 @@ namespace td::actor {
 template <typename T>
 class BackpressureQueueActor : public Actor {
  public:
-  explicit BackpressureQueueActor(size_t capacity) : capacity_(capacity) {
+  // Notify a multiplexing consumer when the queue becomes readable or closes.
+  explicit BackpressureQueueActor(size_t capacity, std::function<void(bool closed)> on_readable = {})
+      : capacity_(capacity), on_readable_(std::move(on_readable)) {
     CHECK(capacity > 0);
   }
 
@@ -32,6 +35,9 @@ class BackpressureQueueActor : public Actor {
       }
       if (items_.size() < capacity_) {
         items_.push(std::move(item));
+        if (on_readable_ && items_.size() == 1) {
+          on_readable_(false);
+        }
         wake_pop_waiter();
         co_return true;
       }
@@ -81,6 +87,9 @@ class BackpressureQueueActor : public Actor {
       return;
     }
     closed_ = true;
+    if (on_readable_) {
+      on_readable_(true);
+    }
     for (auto& w : push_waiters_) {
       w.set_error(td::Status::Error("BackpressureQueue is closed"));
     }
@@ -94,6 +103,7 @@ class BackpressureQueueActor : public Actor {
  private:
   std::queue<T> items_;
   size_t capacity_;
+  std::function<void(bool)> on_readable_;
   bool closed_ = false;
 
   using Waiter = typename StartedTask<td::Unit>::ExternalPromise;
@@ -125,8 +135,8 @@ class BackpressureQueue {
  public:
   BackpressureQueue() = default;
 
-  explicit BackpressureQueue(td::Slice name, size_t capacity) {
-    actor_ = std::make_shared<ActorOwn<A>>(create_actor<A>(name, capacity));
+  explicit BackpressureQueue(td::Slice name, size_t capacity, std::function<void(bool closed)> on_readable = {}) {
+    actor_ = std::make_shared<ActorOwn<A>>(create_actor<A>(name, capacity, std::move(on_readable)));
   }
 
   StartedTask<bool> push(T item) {

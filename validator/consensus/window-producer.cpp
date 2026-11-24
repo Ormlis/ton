@@ -68,7 +68,8 @@ td::actor::Task<GeneratedRoundRef> collate_round(BusHandle bus, ChainStateRef st
   for (int attempt = 0;; ++attempt) {
     td::actor::ActorOwn<ShardGroupExchange> exchange;
     if (!members.empty()) {
-      exchange = td::actor::create_actor<ShardGroupExchange>("shard-group-exchange", members.size());
+      exchange = td::actor::create_actor<ShardGroupExchange>("shard-group-exchange", members.size(),
+                                                             common.wait_externals_until);
       common.group_exchange = exchange.get();
       common.attempt_idx = attempt;
     }

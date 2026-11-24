@@ -6,6 +6,8 @@
 #include "block/signature-set.h"
 #include "consensus/types.h"
 #include "keys/encryptor.h"
+#include "td/actor/BackpressureQueue.h"
+#include "td/actor/TestScheduler.h"
 #include "td/utils/tests.h"
 #include "tl-utils/tl-utils.hpp"
 #include "ton/ton-shard.h"
@@ -55,6 +57,42 @@ TEST(ShardGroups, QueuedTransfersKeepTheirOrder) {
   ShardGroupMessageOrder reversed;
   ASSERT_TRUE(reversed.record(route, 60, true));
   ASSERT_TRUE(!reversed.record(route, 56, false));
+}
+
+TEST(ShardGroups, LateExternalWakesAnIdleGroup) {
+  using Exchange = ShardGroupExchange;
+  using Externals = Exchange::Externals;
+  td::actor::TestScheduler scheduler;
+  scheduler.run([&]() -> td::actor::Task<> {
+    auto sender = shard_child(ShardIdFull{basechainId}, true), receiver = shard_sibling(sender);
+    auto cutoff = td::Timestamp::in(1);
+    auto exchange = td::actor::create_actor<Exchange>("exchange", 2, cutoff);
+    td::actor::BackpressureQueue<int> inputs("externals", 1, [id = exchange.get(), sender](bool closed) {
+      td::actor::send_closure(id, &Exchange::external_queue_ready, sender, closed);
+    });
+    auto next = [&](ShardIdFull shard, Externals ext, Exchange::Transfers outgoing = {}) {
+      return td::actor::ask(exchange, &Exchange::exchange, shard, std::move(outgoing), true, ext);
+    };
+    auto a = next(sender, Externals::wait), b = next(receiver, Externals::done);
+    co_await scheduler.wait_sync_work();
+    ASSERT_TRUE(!a.await_ready() && !b.await_ready());
+    ASSERT_TRUE(co_await inputs.push(42));
+    ASSERT_TRUE((co_await std::move(a)).read_externals);
+    ASSERT_EQ(42, co_await inputs.try_pop());
+    a = next(sender, Externals::wait, {{receiver, 123, {}}});
+    ASSERT_EQ(123u, (co_await std::move(b)).transfers.at(0).lt);
+    b = next(receiver, Externals::done);
+    co_await scheduler.wait_sync_work();
+    ASSERT_TRUE(!a.await_ready() && !b.await_ready());
+    scheduler.advance_time_to(cutoff);
+    ASSERT_TRUE((co_await std::move(a)).read_externals);
+    ASSERT_TRUE(co_await inputs.push(43));
+    auto last = co_await next(sender, Externals::wait);
+    ASSERT_TRUE(!last.read_externals && last.transfers.empty());
+    ASSERT_EQ(1.0, last.wait_externals_time);
+    ASSERT_TRUE((co_await std::move(b)).transfers.empty());
+    co_return td::Unit{};
+  });
 }
 
 TEST(ShardGroups, GroupProofs) {

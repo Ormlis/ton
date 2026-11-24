@@ -77,6 +77,7 @@ static constexpr td::uint32 SPLIT_MAX_QUEUE_SIZE = 100000;
 static constexpr td::uint32 MERGE_MAX_QUEUE_SIZE = 2047;
 static constexpr td::uint32 SKIP_EXTERNALS_QUEUE_SIZE = 8000;
 static constexpr int HIGH_PRIORITY_EXTERNAL = 10;  // don't skip high priority externals when queue is big
+static constexpr size_t SHARD_GROUP_BATCH_SIZE = 32;
 
 /**
  * Constructs a Collator object.
@@ -240,7 +241,13 @@ void Collator::start_up() {
   // 3. install external message queue
   if (!params_.is_hardfork) {
     LOG(DEBUG) << "installing external message queue";
-    ext_msg_queue_ = ExtMsgQueue("ext_msg_queue", 500);
+    std::function<void(bool)> on_readable;
+    if (!params_.group_exchange.empty() && params_.wait_externals_until) {
+      on_readable = [exchange = params_.group_exchange, shard = shard_](bool closed) {
+        td::actor::send_closure(exchange, &ShardGroupExchange::external_queue_ready, shard, closed);
+      };
+    }
+    ext_msg_queue_ = ExtMsgQueue("ext_msg_queue", 500, std::move(on_readable));
     auto callback = std::make_unique<ExtMsgCallback>();
     callback->shard = shard_;
     callback->cancellation_token = ext_msg_cancellation_.get_cancellation_token();
@@ -2577,9 +2584,6 @@ td::actor::Task<> Collator::do_collate_inner() {
     if (params_.group_exchange.empty()) {
       co_await process_external_and_new_messages();
     } else {
-      if (!co_await process_inbound_external_messages()) {
-        co_return td::Status::Error("Cannot process external messages in shard group");
-      }
       co_await process_group_messages();
     }
   }
@@ -3454,12 +3458,13 @@ bool Collator::create_ticktock_transaction(const ton::StdSmcAddress& smc_addr, t
  * @param msg_metadata Metadata of the inbound message.
  * @param after_lt Transaction lt will be grater than after_lt. Used for deferred messages.
  * @param is_special_tx True if creating a special transaction (mint/recover), false otherwise.
+ * @param exceeds_lt_limit For an optional import, report a transaction that cannot fit before committing it.
  *
  * @returns The root of the serialized transaction, or an empty reference if the transaction creation fails.
  */
 Ref<vm::Cell> Collator::create_ordinary_transaction(Ref<vm::Cell> msg_root,
                                                     td::optional<block::MsgMetadata> msg_metadata, LogicalTime after_lt,
-                                                    bool is_special_tx) {
+                                                    bool is_special_tx, bool* exceeds_lt_limit) {
   ton::StdSmcAddress addr;
   auto cs = vm::load_cell_slice(msg_root);
   bool external;
@@ -3530,6 +3535,10 @@ Ref<vm::Cell> Collator::create_ordinary_transaction(Ref<vm::Cell> msg_root,
   }
   std::unique_ptr<block::transaction::Transaction> trans = res.move_as_ok();
 
+  if (exceeds_lt_limit && trans->end_lt - start_lt > block_limits_->lt_delta.hard()) {
+    *exceeds_lt_limit = true;
+    return {};
+  }
   if (!trans->update_limits(*block_limit_status_,
                             /* with_gas = */ !(is_special_tx && compute_phase_cfg_.special_gas_full))) {
     fatal_error("cannot update block limit status to include the new transaction");
@@ -3957,28 +3966,47 @@ int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, R
   return 1;
 }
 
-// Drain local work, then consume whatever peers have actually produced. A late or declined offer stays queued.
 td::actor::Task<> Collator::process_group_messages() {
   std::set<ShardGroupMessageOrder::Route> declined;
   auto can_execute = [&] {
     return !block_full_ && inbound_queues_empty_ && !have_unprocessed_account_dispatch_queue_ &&
            block_limit_status_->fits(block::ParamLimits::cl_normal) && !internal_msg_timeout_.is_in_past();
   };
+  using Externals = ShardGroupExchange::Externals;
+  // Snapshot-only producers close their queue after pushing the initial messages.
+  auto batch_size = params_.wait_externals_until ? SHARD_GROUP_BATCH_SIZE : std::numeric_limits<size_t>::max();
+  bool read_externals = true;
+  LogicalTime external_floor = 0;
   while (true) {
+    bool more_externals = read_externals && co_await process_inbound_external_messages(batch_size, external_floor);
     bool enqueue_only = !can_execute();
     if (!process_new_messages(enqueue_only)) {
       co_return td::Status::Error("Cannot process shard group outputs");
     }
-    auto inbox = co_await td::actor::ask(params_.group_exchange, &ShardGroupExchange::exchange, shard_,
-                                         std::exchange(group_exports_, {}), !can_execute());
-    if (inbox.empty()) {
+    auto externals = Externals::done;
+    if (params_.wait_externals_until && !params_.is_hardfork && !skip_extmsg_ && params_.attempt_idx < 2 &&
+        block_limit_status_->fits(block::ParamLimits::cl_soft) && !external_msg_timeout_.is_in_past()) {
+      externals = more_externals ? Externals::ready : Externals::wait;
+    }
+    auto work = co_await td::actor::ask(params_.group_exchange, &ShardGroupExchange::exchange, shard_,
+                                        std::exchange(group_exports_, {}), can_execute(), externals);
+    auto& inbox = work.transfers;
+    read_externals = work.read_externals;
+    if (inbox.empty() && !read_externals) {
+      wait_externals_total_time_ += work.wait_externals_time;
       co_return td::Unit{};
     }
     std::sort(inbox.begin(), inbox.end(), [](const auto& a, const auto& b) {
       return a.lt != b.lt ? a.lt < b.lt : a.envelope->get_hash() < b.envelope->get_hash();
     });
-    // Outputs from this batch must follow every local output already offered to another member.
+    // Local outputs will be drained after the entire batch of peer imports.
     auto batch_floor = max_lt;
+    for (auto it = inbox.rbegin(); it != inbox.rend() && it->lt > batch_floor; ++it) {
+      if (it->lt - start_lt < block_limits_->lt_delta.hard() - 1) {
+        batch_floor = it->lt;
+        break;
+      }
+    }
     for (auto& offer : inbox) {
       if (!can_execute()) {
         break;
@@ -3996,7 +4024,12 @@ td::actor::Task<> Collator::process_group_messages() {
         declined.insert(route);
         continue;
       }
-      auto trans = create_ordinary_transaction(env.msg, env.metadata, floor, false);
+      bool exceeds_lt_limit = false;
+      auto trans = create_ordinary_transaction(env.msg, env.metadata, floor, false, &exceeds_lt_limit);
+      if (exceeds_lt_limit) {
+        declined.insert(route);
+        continue;
+      }
       LogicalTime trans_lt;
       StdSmcAddress account;
       vm::CellBuilder cb, receipt;
@@ -4012,6 +4045,8 @@ td::actor::Task<> Collator::process_group_messages() {
       }
       group_last_import_lt_[route.second] = offer.lt;
     }
+    // A late external can generate a local message for an account just served by a peer.
+    external_floor = max_lt;
   }
 }
 
@@ -4459,9 +4494,7 @@ td::actor::Task<> Collator::process_external_and_new_messages() {
     LOG(INFO) << "process inbound external messages";
     {
       td::ScopedRealCpuTimer::Guard timer_total{work_timer_total_, nullptr};
-      if (!co_await process_inbound_external_messages()) {
-        co_return td::Status::Error("cannot process inbound external messages");
-      }
+      co_await process_inbound_external_messages();
     }
     // 6. process newly-generated messages (if space&gas left)
     //    (if we were unable to process all inbound messages, all new messages must be queued)
@@ -4476,7 +4509,7 @@ td::actor::Task<> Collator::process_external_and_new_messages() {
       LOG(INFO) << "Don't wait for new external messages";
       break;
     }
-    if (skip_extmsg_ || params_.attempt_idx >= 2) {
+    if (skip_extmsg_ || params_.is_hardfork || params_.attempt_idx >= 2) {
       LOG(INFO) << "Processing external messages is disabled, don't wait for new external messages";
       break;
     }
@@ -4503,25 +4536,25 @@ td::actor::Task<> Collator::process_external_and_new_messages() {
  * Processes inbound external messages.
  * Messages are processed until the medium limit is reached, medium timeout is reached or there are no more messages.
  *
- * @returns True if the processing was successful, false otherwise.
+ * @returns True if the batch limit was reached and the queue may contain more messages.
  */
-td::actor::Task<bool> Collator::process_inbound_external_messages() {
+td::actor::Task<bool> Collator::process_inbound_external_messages(size_t limit, LogicalTime after_lt) {
   // Existing per-message total timers exclude queue waits, so their delta is this phase's active work.
   td::ScopedRealCpuTimer::Guard timer_total{work_timer_total_, &stats_.work_time.total};
   td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.import_externals};
   SCOPE_EXIT {
     stats_.load_fraction_externals = block_limit_status_->load_fraction(block::ParamLimits::cl_soft);
   };
-  if (skip_extmsg_) {
+  if (skip_extmsg_ || params_.is_hardfork) {
     LOG(INFO) << "skipping processing of inbound external messages";
-    co_return true;
+    co_return false;
   }
   if (params_.attempt_idx >= 2) {
     LOG(INFO) << "Attempt #" << params_.attempt_idx << ": skip external messages (attempt >= 2)";
-    co_return true;
+    co_return false;
   }
   bool full = !block_limit_status_->fits(block::ParamLimits::cl_soft);
-  while (true) {
+  while (limit > 0) {
     if (full) {
       LOG(INFO) << "BLOCK FULL, stop processing external messages";
       stats_.limits_log += PSTRING() << "INBOUND_EXT_MESSAGES: "
@@ -4534,7 +4567,7 @@ td::actor::Task<bool> Collator::process_inbound_external_messages() {
       break;
     }
     if (!check_cancelled()) {
-      co_return false;
+      co_return td::Status::Error("Cannot process inbound external messages: collation cancelled");
     }
     std::pair<td::Ref<ExtMessage>, int> item;
     if (pending_ext_msg_) {
@@ -4557,6 +4590,7 @@ td::actor::Task<bool> Collator::process_inbound_external_messages() {
       }
       item = maybe.move_as_ok();
     }
+    --limit;
     auto [ext_msg_ref, priority] = std::move(item);
     ++stats_.ext_msgs_total;
     if (out_msg_queue_size_ > SKIP_EXTERNALS_QUEUE_SIZE && priority < HIGH_PRIORITY_EXTERNAL) {
@@ -4574,8 +4608,13 @@ td::actor::Task<bool> Collator::process_inbound_external_messages() {
       continue;
     }
     auto ext_msg = ext_msg_ref->root_cell();
-    ton::Bits256 hash{ext_msg->get_hash().bits()};
-    int r = process_external_message(std::move(ext_msg));
+    int r = process_external_message(std::move(ext_msg), after_lt);
+    if (r == 2) {
+      // Leave this message eligible for the next block and close this member's external intake.
+      processed_external_messages_ = processed_external_messages_.erase(ext_msg_ref->hash_norm());
+      skip_extmsg_ = true;
+      co_return false;
+    }
     if (r > 0) {
       ++stats_.ext_msgs_accepted;
     } else {
@@ -4583,7 +4622,7 @@ td::actor::Task<bool> Collator::process_inbound_external_messages() {
     }
     if (r < 0) {
       bad_ext_msgs_.emplace_back(ext_msg_ref->hash_norm());
-      co_return false;
+      co_return td::Status::Error("Cannot process inbound external message");
     }
     if (r == 0) {
       bad_ext_msgs_.emplace_back(ext_msg_ref->hash_norm());
@@ -4593,7 +4632,7 @@ td::actor::Task<bool> Collator::process_inbound_external_messages() {
       block_limit_class_ = std::max(block_limit_class_, block_limit_status_->classify());
     }
   }
-  co_return true;
+  co_return limit == 0;
 }
 
 /**
@@ -4605,8 +4644,9 @@ td::actor::Task<bool> Collator::process_inbound_external_messages() {
  *          -1 if a fatal error occurred.
  *           0 if the message is rejected.
  *           1 if the message was processed.
+ *           2 if the transaction would exceed the block LT limit.
  */
-int Collator::process_external_message(Ref<vm::Cell> msg) {
+int Collator::process_external_message(Ref<vm::Cell> msg, LogicalTime after_lt) {
   auto cs = load_cell_slice(msg);
   td::RefInt256 fwd_fees;
   block::gen::CommonMsgInfo::Record_ext_in_msg_info info;
@@ -4618,7 +4658,12 @@ int Collator::process_external_message(Ref<vm::Cell> msg) {
   }
   // process message by a transaction in this block:
   // 1. create a Transaction processing this Message
-  auto trans_root = create_ordinary_transaction(msg, /* metadata = */ {}, 0);
+  bool exceeds_lt_limit = false;
+  auto trans_root = create_ordinary_transaction(msg, /* metadata = */ {}, after_lt, false,
+                                                params_.group_exchange.empty() ? nullptr : &exceeds_lt_limit);
+  if (exceeds_lt_limit) {
+    return 2;
+  }
   if (trans_root.is_null()) {
     if (busy_) {
       // transaction rejected by account
@@ -5094,7 +5139,7 @@ bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_rema
         if (offer_to_group && !defer && shard_contains(peer, next_hop) &&
             group_message_order_.can_deliver(route, msg.lt)) {
           group_exports_.push_back({peer, msg.lt, msg_env});
-          if (group_exports_.size() == 32) {
+          if (group_exports_.size() == SHARD_GROUP_BATCH_SIZE) {
             td::actor::send_closure(params_.group_exchange, &ShardGroupExchange::publish,
                                     std::exchange(group_exports_, {}));
           }
