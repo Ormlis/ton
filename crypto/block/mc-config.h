@@ -431,6 +431,10 @@ struct ValidatorRegistryConfig {
 struct CatchainValidatorsConfig {
   td::uint32 mc_cc_lifetime, shard_cc_lifetime, shard_val_lifetime, shard_val_num;
   bool shuffle_mc_val;
+  unsigned member_depth = 0, group_levels = 0;
+  ton::ShardIdFull validator_shard(ton::ShardIdFull shard) const;
+  std::vector<ton::ShardIdFull> group_members(ton::ShardIdFull member) const;
+  static std::vector<ton::ShardIdFull> group_members_at(ton::ShardIdFull member, unsigned levels);
   CatchainValidatorsConfig(td::uint32 mc_cc_lt_, td::uint32 sh_cc_lt_, td::uint32 sh_val_lt_, td::uint32 sh_val_num_,
                            bool shuffle_mc = false)
       : mc_cc_lifetime(mc_cc_lt_)
@@ -503,6 +507,7 @@ class ShardConfig {
   std::vector<ton::WorkchainId> get_workchains() const;
   Ref<McShardHash> get_shard_hash(ton::ShardIdFull id, bool exact = true) const;
   bool contains(ton::BlockIdExt blkid) const;
+  ton::CatchainSeqno shard_group_rotation(ton::ShardIdFull shard, const CatchainValidatorsConfig& ccvc) const;
   bool get_shard_hash_raw(vm::CellSlice& cs, ton::ShardIdFull id, ton::ShardIdFull& true_id, bool exact = true) const;
   ton::LogicalTime get_shard_end_lt(ton::AccountIdPrefixFull acc) const;
   ton::LogicalTime get_shard_end_lt_ext(ton::AccountIdPrefixFull acc, ton::ShardIdFull& actual_shard) const;

@@ -84,6 +84,7 @@ class MasterchainState : virtual public ShardState {
   virtual bool ancestor_is_valid(BlockIdExt id) const = 0;
   virtual NewConsensusConfig get_new_consensus_config(WorkchainId wc) const = 0;
   virtual block::CatchainValidatorsConfig get_catchain_validators_config() const = 0;
+  std::vector<ShardIdFull> active_shard_group(ShardIdFull shard) const;
   virtual BlockIdExt last_key_block_id() const = 0;
   virtual BlockIdExt next_key_block_id(BlockSeqno seqno) const = 0;
   virtual BlockIdExt prev_key_block_id(BlockSeqno seqno) const = 0;

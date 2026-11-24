@@ -852,13 +852,68 @@ CatchainValidatorsConfig Config::unpack_catchain_validators_config(Ref<vm::Cell>
               cfg.shard_validators_num};
     }
     block::gen::CatchainConfig::Record_catchain_config_new cfg2;
-    if (tlb::unpack_cell(std::move(cell), cfg2)) {
+    if (tlb::unpack_cell(cell, cfg2)) {
       return {cfg2.mc_catchain_lifetime, cfg2.shard_catchain_lifetime, cfg2.shard_validators_lifetime,
               cfg2.shard_validators_num, cfg2.shuffle_mc_validators};
+    }
+    block::gen::CatchainConfig::Record_catchain_config_groups grouped;
+    if (tlb::unpack_cell(std::move(cell), grouped)) {
+      CatchainValidatorsConfig config{grouped.mc_catchain_lifetime, grouped.shard_catchain_lifetime,
+                                      grouped.shard_validators_lifetime, grouped.shard_validators_num,
+                                      grouped.shuffle_mc_validators};
+      config.member_depth = grouped.member_depth;
+      config.group_levels = grouped.group_levels;
+      return config;
     }
   }
   return {default_mc_catchain_lifetime, default_shard_catchain_lifetime, default_shard_validators_lifetime,
           default_shard_validators_num};
+}
+
+ton::ShardIdFull CatchainValidatorsConfig::validator_shard(ton::ShardIdFull shard) const {
+  if (group_levels && group_levels <= member_depth && shard.workchain == ton::basechainId &&
+      shard.pfx_len() == static_cast<int>(member_depth)) {
+    return ton::shard_prefix(shard, member_depth - group_levels);
+  }
+  return shard;
+}
+
+std::vector<ton::ShardIdFull> CatchainValidatorsConfig::group_members(ton::ShardIdFull member) const {
+  return member.pfx_len() == static_cast<int>(member_depth) ? group_members_at(member, group_levels)
+                                                            : std::vector<ton::ShardIdFull>{};
+}
+
+std::vector<ton::ShardIdFull> CatchainValidatorsConfig::group_members_at(ton::ShardIdFull member, unsigned levels) {
+  if (!levels || levels > 3 || !member.is_valid_ext() || member.workchain != ton::basechainId ||
+      member.pfx_len() < static_cast<int>(levels) || member.pfx_len() > 60) {
+    return {};
+  }
+  std::vector<ton::ShardIdFull> leaves{ton::shard_prefix(member, member.pfx_len() - levels)};
+  for (unsigned i = 0; i < levels; ++i) {
+    std::vector<ton::ShardIdFull> next;
+    for (auto shard : leaves) {
+      next.push_back(ton::shard_child(shard, true));
+      next.push_back(ton::shard_child(shard, false));
+    }
+    leaves = std::move(next);
+  }
+  return leaves;
+}
+
+// Read the previous masterchain layout. Once every leaf exists, bring independently rotated
+// catchains to a fresh common epoch before admitting group certificates.
+ton::CatchainSeqno ShardConfig::shard_group_rotation(ton::ShardIdFull shard,
+                                                     const CatchainValidatorsConfig& ccvc) const {
+  ton::CatchainSeqno lowest = ~0U, highest = 0;
+  for (auto id : ccvc.group_members(shard)) {
+    auto prev = get_shard_hash(id, true);
+    if (prev.is_null() || prev->before_split_ || prev->before_merge_) {
+      return 0;
+    }
+    lowest = std::min(lowest, prev->next_catchain_seqno_);
+    highest = std::max(highest, prev->next_catchain_seqno_);
+  }
+  return lowest < highest ? highest + 1 : 0;
 }
 
 CatchainValidatorsConfig Config::get_catchain_validators_config() const {
@@ -1977,7 +2032,8 @@ std::vector<ton::ValidatorDescr> Config::do_compute_validator_set(const Catchain
     return {};  // no validators?
   }
   nodes.reserve(count);
-  ValidatorSetPRNG gen{shard, cc_seqno};  // use zero seed (might use a non-trivial seed from ccv_conf in the future)
+  ValidatorSetPRNG gen{ccv_conf.validator_shard(shard),
+                       cc_seqno};  // use zero seed (might use a non-trivial seed from ccv_conf in the future)
   if (is_mc) {
     if (ccv_conf.shuffle_mc_val) {
       // shuffle mc validators from the head of the list

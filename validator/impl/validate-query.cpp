@@ -2292,24 +2292,28 @@ bool ValidateQuery::check_one_shard(const block::McShardHash& info, const block:
                           " in shard configuration, but merge conditions are not met");
     }
   }
-  bool cc_updated = (info.next_catchain_seqno_ != cc_seqno);
-  if (info.next_catchain_seqno_ != cc_seqno + (unsigned)cc_updated) {
-    return reject_query(PSTRING() << "new shard configuration for shard " << shard << " changed catchain seqno from "
-                                  << cc_seqno << " to " << info.next_catchain_seqno_
-                                  << " (only updates by at most one are allowed)");
-  }
-  if (!cc_updated && update_shard_cc_) {
-    return reject_query(PSTRING() << "new shard configuration for shard " << shard << " has unchanged catchain seqno "
-                                  << cc_seqno << ", but it must have been updated for all shards");
-  }
-  bool bm_cleared = !info.before_merge_ && old_before_merge;
-  if (!cc_updated && bm_cleared && !workchain_created) {
-    return reject_query(PSTRING() << "new shard configuration for shard " << shard << " has unchanged catchain seqno "
-                                  << cc_seqno << " while the before_merge bit has been cleared");
-  }
-  if (cc_updated && !(update_shard_cc_ || bm_cleared)) {
-    return reject_query(PSTRING() << "new shard configuration for shard " << shard << " has increased catchain seqno "
-                                  << cc_seqno << " without a good reason");
+  if (auto epoch = old_shard_conf_->shard_group_rotation(shard, ccvc)) {
+    REJECT_UNLESS_MSG(info.next_catchain_seqno_ == epoch, "Incorrect catchain rotation for newly aligned shard group");
+  } else {
+    bool cc_updated = (info.next_catchain_seqno_ != cc_seqno);
+    if (info.next_catchain_seqno_ != cc_seqno + (unsigned)cc_updated) {
+      return reject_query(PSTRING() << "new shard configuration for shard " << shard << " changed catchain seqno from "
+                                    << cc_seqno << " to " << info.next_catchain_seqno_
+                                    << " (only updates by at most one are allowed)");
+    }
+    if (!cc_updated && update_shard_cc_) {
+      return reject_query(PSTRING() << "new shard configuration for shard " << shard << " has unchanged catchain seqno "
+                                    << cc_seqno << ", but it must have been updated for all shards");
+    }
+    bool bm_cleared = !info.before_merge_ && old_before_merge;
+    if (!cc_updated && bm_cleared && !workchain_created) {
+      return reject_query(PSTRING() << "new shard configuration for shard " << shard << " has unchanged catchain seqno "
+                                    << cc_seqno << " while the before_merge bit has been cleared");
+    }
+    if (cc_updated && !(update_shard_cc_ || bm_cleared)) {
+      return reject_query(PSTRING() << "new shard configuration for shard " << shard << " has increased catchain seqno "
+                                    << cc_seqno << " without a good reason");
+    }
   }
   min_shard_ref_mc_seqno_ = std::min(min_shard_ref_mc_seqno_, info.min_ref_mc_seqno_);
   max_shard_utime_ = std::max(max_shard_utime_, info.gen_utime_);

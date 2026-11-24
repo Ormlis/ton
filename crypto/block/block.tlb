@@ -763,6 +763,15 @@ catchain_config_new#c2 flags:(## 7) { flags = 0 } shuffle_mc_validators:Bool
   shard_validators_lifetime:(## 32) { shard_validators_lifetime >= 1 }
   shard_validators_num:(## 32) { shard_validators_num >= 1 } = CatchainConfig;
 
+// Basechain leaves at member_depth share a session across 2^group_levels adjacent shards.
+catchain_config_groups#c3 flags:(## 7) { flags = 0 } shuffle_mc_validators:Bool
+  mc_catchain_lifetime:(## 32) { mc_catchain_lifetime >= 1 }
+  shard_catchain_lifetime:(## 32) { shard_catchain_lifetime >= 1 }
+  shard_validators_lifetime:(## 32) { shard_validators_lifetime >= 1 }
+  shard_validators_num:(## 32) { shard_validators_num >= 1 }
+  member_depth:(## 6) { member_depth <= 60 }
+  group_levels:(## 2) { group_levels >= 1 } { group_levels <= member_depth } = CatchainConfig;
+
 consensus_config#d6 round_candidates:# { round_candidates >= 1 }
   next_candidate_delay_ms:uint32 consensus_timeout_ms:uint32
   fast_attempts:uint32 attempt_duration:uint32 catchain_max_deps:uint32

@@ -5202,8 +5202,8 @@ bool Collator::update_shard_config(const block::WorkchainSet& wc_set, const bloc
   Ref<block::WorkchainInfo> wc_info;
   ton::BlockSeqno& min_seqno = min_ref_mc_seqno_;
   return shard_conf_->process_sibling_shard_hashes(
-      [&wc_set, &wc_id, &wc_info, &ccvc, &min_seqno, now = now_, update_cc](block::McShardHash& cur,
-                                                                            const block::McShardHash* sibling) {
+      [this, &wc_set, &wc_id, &wc_info, &ccvc, &min_seqno, now = now_, update_cc](block::McShardHash& cur,
+                                                                                  const block::McShardHash* sibling) {
         if (!cur.is_valid()) {
           return -2;
         }
@@ -5217,7 +5217,12 @@ bool Collator::update_shard_config(const block::WorkchainSet& wc_set, const bloc
           }
         }
         min_seqno = std::min(min_seqno, cur.min_ref_mc_seqno_);
-        return update_one_shard(cur, sibling, wc_info.get(), now, ccvc, update_cc);
+        int changed = update_one_shard(cur, sibling, wc_info.get(), now, ccvc, update_cc);
+        if (auto epoch = config_->shard_group_rotation(cur.shard(), ccvc)) {
+          cur.next_catchain_seqno_ = epoch;
+          changed = 1;
+        }
+        return changed;
       });
 }
 

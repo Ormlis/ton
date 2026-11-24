@@ -400,6 +400,18 @@ Ref<block::ValidatorSet> MasterchainStateQ::compute_validator_set(ShardIdFull sh
   return Ref<block::ValidatorSet>{true, ccseqno, shard, std::move(nodes)};
 }
 
+std::vector<ShardIdFull> MasterchainState::active_shard_group(ShardIdFull shard) const {
+  auto members = get_catchain_validators_config().group_members(shard);
+  for (const auto& member : members) {
+    auto descr = get_shard_from_config(member, true);
+    if (descr.is_null() || descr->before_split() || descr->before_merge() ||
+        get_shard_cc_seqno(member) != get_shard_cc_seqno(shard)) {
+      return {};
+    }
+  }
+  return members;
+}
+
 Ref<block::ValidatorSet> MasterchainStateQ::get_validator_set(ShardIdFull shard) const {
   if (!config_ || !cur_validators_) {
     LOG(ERROR) << "MasterchainStateQ::get_validator_set() : no config or no cur_validators";
