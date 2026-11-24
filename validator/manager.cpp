@@ -241,8 +241,10 @@ td::actor::Task<> ValidatorManagerImpl::generate_shard_block_description(BlockId
   CatchainSeqno cc_seqno = sig_set->get_catchain_seqno();
   CO_TRY(check_need_generate_shard_block_description(block_id, cc_seqno));
   active_shard_block_desc_generation_.insert(block_id);
+  // A failed await can destroy the coroutine frame on the worker that completed it.
+  auto self = actor_id(this);
   SCOPE_EXIT {
-    active_shard_block_desc_generation_.erase(block_id);
+    td::actor::send_lambda(self, [this, block_id] { active_shard_block_desc_generation_.erase(block_id); });
   };
 
   ShardIdFull shard = block_id.shard_full();
@@ -695,8 +697,9 @@ td::actor::Task<> ValidatorManagerImpl::try_process_pending_block_finality_inner
     VLOG(validator, DEBUG) << "Dropping duplicate candidate+finality for " << block_id;
     co_return {};
   }
+  auto self = actor_id(this);
   SCOPE_EXIT {
-    active_broadcast_checks_.erase(block_id);
+    td::actor::send_lambda(self, [this, block_id] { active_broadcast_checks_.erase(block_id); });
   };
   BlockBroadcast broadcast = co_await create_broadcast(block_id, std::move(data), signatures, serialized_signatures);
   auto [task, promise] = td::actor::StartedTask<>::make_bridge();
