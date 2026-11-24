@@ -570,16 +570,20 @@ class PoolImpl : public td::actor::SpawnsWith<Bus>, public td::actor::ConnectsTo
     if (query->slot > now_ + params_.max_leader_window_desync * slots_per_leader_window_) {
       co_return td::Status::Error("Slot is too far in the future");
     }
+    auto it = seen_broadcasts_.find(query->slot);
+    if (it != seen_broadcasts_.end()) {
+      if (it->second.group_hash != query->group_hash) {
+        co_return td::Status::Error("Conflicting candidate broadcast");
+      }
+      auto part = it->second.parts.find(query->member);
+      if (part != it->second.parts.end() && part->second != query->broadcast_id) {
+        co_return td::Status::Error("Duplicate broadcast");
+      }
+    }
     if (query->signature_checked) {
-      auto [it, inserted] = seen_broadcasts_.emplace(query->slot, query->broadcast_id);
-      if (!inserted && it->second != query->broadcast_id) {
-        co_return td::Status::Error("Duplicate broadcast");
-      }
-    } else {
-      auto it = seen_broadcasts_.find(query->slot);
-      if (it != seen_broadcasts_.end() && it->second != query->broadcast_id) {
-        co_return td::Status::Error("Duplicate broadcast");
-      }
+      auto &slot = seen_broadcasts_[query->slot];
+      slot.group_hash = query->group_hash;
+      slot.parts.emplace(query->member, query->broadcast_id);
     }
     co_return {};
   }
@@ -965,6 +969,7 @@ class PoolImpl : public td::actor::SpawnsWith<Bus>, public td::actor::ConnectsTo
     last_finalized_block_ = id;
     last_final_cert_ = cert;
     first_nonfinalized_slot_ = id.slot + 1;
+    seen_broadcasts_.erase(seen_broadcasts_.begin(), seen_broadcasts_.lower_bound(first_nonfinalized_slot_));
     owning_bus().publish<FinalizationObserved>(id, cert);
 
     if (now_ <= id.slot) {
@@ -1025,7 +1030,11 @@ class PoolImpl : public td::actor::SpawnsWith<Bus>, public td::actor::ConnectsTo
 
   std::vector<Request> requests_;
 
-  std::map<td::uint32, td::Bits256> seen_broadcasts_;
+  struct SlotBroadcast {
+    std::optional<td::Bits256> group_hash;
+    std::map<int, td::Bits256> parts;
+  };
+  std::map<td::uint32, SlotBroadcast> seen_broadcasts_;
 };
 
 }  // namespace

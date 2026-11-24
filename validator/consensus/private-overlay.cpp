@@ -42,7 +42,7 @@ class PrivateOverlayImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
     std::vector<td::Bits256> overlay_nodes_tl;
     std::map<PublicKeyHash, td::uint32> authorized_keys;
 
-    td::uint32 max_broadcast_size = bus.candidate_size_limit();
+    td::uint32 max_broadcast_size = bus.member_size_limit();
     for (const auto& peer : bus.validator_set) {
       adnl_id_to_peer_[peer.adnl_id] = peer;
       broadcast_src_to_peer_[peer.short_id] = peer;
@@ -152,6 +152,19 @@ class PrivateOverlayImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
 
   template <>
   void handle(BusHandle, std::shared_ptr<const CandidateGenerated> event) {
+    const auto& candidate = *event->candidate;
+    if (!candidate.is_empty() && candidate.blocks().size() > 1) {
+      auto parts = candidate.encoded_blocks();
+      for (size_t i = 0; i < parts.size(); ++i) {
+        auto extra = create_serialize_tl_object<ton_api::consensus_broadcastGroupPart>(
+            candidate.delegation ? 1 : 0, candidate.id.slot, static_cast<int>(i), candidate.id.hash,
+            CandidateId::parent_id_to_tl(candidate.parent_id), candidate.signature.clone(),
+            candidate.delegation ? candidate.delegation->to_tl() : nullptr);
+        td::actor::send_closure(overlays_, &overlay::Overlays::send_broadcast_fec_with_extra, local_adnl_id_,
+                                overlay_id_, local_broadcast_src_, 0, std::move(parts[i]), std::move(extra));
+      }
+      return;
+    }
     td::BufferSlice extra;
     if (event->candidate->delegation) {
       extra = create_serialize_tl_object<tl::broadcastExtra>(1, event->candidate->id.slot,
@@ -216,7 +229,11 @@ class PrivateOverlayImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
       return;
     }
 
-    auto parsed_extra = parse_broadcast_extra(extra).move_as_ok();
+    auto parsed = parse_broadcast_extra(extra);
+    if (parsed.is_error()) {
+      return;
+    }
+    auto parsed_extra = parsed.move_as_ok();
 
     Candidate::Signer signer;
     if (parsed_extra.delegation) {
@@ -229,8 +246,46 @@ class PrivateOverlayImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
       }
       signer = it->second.idx;
     }
-    auto maybe_candidate =
-        Candidate::deserialize_from_broadcast(std::move(data), std::move(signer), bus, parsed_extra.slot);
+    td::Result<CandidateRef> maybe_candidate;
+    if (parsed_extra.group_hash) {
+      // Precheck authenticates the slot leader and bounds the index. Never retain an unbounded number of partial slots.
+      auto it = partial_.find(parsed_extra.slot);
+      if (it == partial_.end()) {
+        if (partial_.size() == max_partial_slots) {
+          partial_.erase(partial_.begin());
+        }
+        it = partial_
+                 .emplace(parsed_extra.slot, PartialGroup{src, *parsed_extra.group_hash,
+                                                          std::vector<td::BufferSlice>(bus.group_members.size())})
+                 .first;
+      }
+      auto& group = it->second;
+      if (group.source != src || group.hash != *parsed_extra.group_hash || data.empty() ||
+          !group.parts[parsed_extra.member].empty()) {
+        return;
+      }
+      group.bytes += data.size() + 8;
+      if (group.bytes > Bus::max_group_candidate_bytes) {
+        partial_.erase(it);
+        return;
+      }
+      group.parts[parsed_extra.member] = std::move(data);
+      if (++group.received != group.parts.size()) {
+        return;
+      }
+      auto assembled = create_tl_object<ton_api::consensus_blockGroup>(
+          parsed_extra.slot, CandidateId::parent_id_to_tl(parsed_extra.parent), std::move(group.parts),
+          std::move(parsed_extra.signature));
+      partial_.erase(it);
+      maybe_candidate =
+          Candidate::deserialize_broadcast_data(std::move(assembled), std::move(signer), bus, parsed_extra.slot);
+      if (maybe_candidate.is_ok() && maybe_candidate.ok()->id.hash != *parsed_extra.group_hash) {
+        return;
+      }
+    } else {
+      maybe_candidate =
+          Candidate::deserialize_from_broadcast(std::move(data), std::move(signer), bus, parsed_extra.slot);
+    }
 
     if (maybe_candidate.is_error()) {
       // FIXME: If we actually collected signed broadcast parts, we could have produced a
@@ -274,7 +329,8 @@ class PrivateOverlayImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
     }
 
     co_return co_await owning_bus()
-        .publish<PrecheckCandidateBroadcast>(parsed_extra.slot, broadcast_id, signature_checked)
+        .publish<PrecheckCandidateBroadcast>(parsed_extra.slot, broadcast_id, signature_checked, parsed_extra.member,
+                                             parsed_extra.group_hash)
         .trace("Precheck failed");
   }
 
@@ -318,21 +374,47 @@ class PrivateOverlayImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
   std::vector<adnl::AdnlNodeIdShort> overlay_nodes_;
   std::vector<adnl::AdnlNodeIdShort> other_overlay_nodes_;
 
+  struct PartialGroup {
+    PublicKeyHash source;
+    td::Bits256 hash;
+    std::vector<td::BufferSlice> parts;
+    size_t bytes = 1024;
+    size_t received = 0;
+  };
+  static constexpr size_t max_partial_slots = 4;
+  std::map<td::uint32, PartialGroup> partial_;
+
   struct ParsedExtra {
-    td::uint32 slot;
+    td::uint32 slot = 0;
     std::optional<Delegation> delegation;
+    int member = -1;
+    std::optional<td::Bits256> group_hash;
+    ParentId parent;
+    td::BufferSlice signature;
   };
 
-  static td::Result<ParsedExtra> parse_broadcast_extra(td::Slice extra) {
+  td::Result<ParsedExtra> parse_broadcast_extra(td::Slice extra) {
     TRY_RESULT(parsed, fetch_tl_object<tl::BroadcastExtra>(extra, true));
     ParsedExtra result;
-    auto legacy_fn = [&](tl::broadcastExtraLegacy& legacy) {
-      result = ParsedExtra{static_cast<td::uint32>(legacy.slot_), std::nullopt};
-    };
+    auto legacy_fn = [&](tl::broadcastExtraLegacy& legacy) { result.slot = static_cast<td::uint32>(legacy.slot_); };
     auto current_fn = [&](tl::broadcastExtra& current) {
-      result = ParsedExtra{static_cast<td::uint32>(current.slot_), Delegation::from_tl(std::move(current.delegation_))};
+      result.slot = static_cast<td::uint32>(current.slot_);
+      result.delegation = Delegation::from_tl(std::move(current.delegation_));
     };
-    ton_api::downcast_call(*parsed, td::overloaded(legacy_fn, current_fn));
+    auto part_fn = [&](ton_api::consensus_broadcastGroupPart& part) {
+      result = ParsedExtra{static_cast<td::uint32>(part.slot_),
+                           Delegation::from_tl(std::move(part.delegation_)),
+                           part.member_,
+                           part.hash_,
+                           CandidateId::tl_to_parent_id(part.parent_),
+                           std::move(part.signature_)};
+    };
+    ton_api::downcast_call(*parsed, td::overloaded(legacy_fn, current_fn, part_fn));
+    if (result.group_hash &&
+        (result.member < 0 || static_cast<size_t>(result.member) >= owning_bus()->group_members.size() ||
+         result.signature.size() != 64)) {
+      return td::Status::Error("Invalid shard group broadcast part");
+    }
     return result;
   }
 

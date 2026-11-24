@@ -872,6 +872,7 @@ consensus.delegationToSign window_start_slot:int collator_id:int256 = consensus.
 consensus.delegation collator_key:PublicKey signature:bytes = consensus.Delegation;
 consensus.candidate flags:# data:consensus.CandidateData delegation:flags.0?consensus.Delegation = consensus.Candidate;
 
+consensus.broadcastGroupPart flags:# slot:int member:int hash:int256 parent:consensus.CandidateParent signature:bytes delegation:flags.0?consensus.Delegation = consensus.BroadcastExtra;
 consensus.broadcastExtraLegacy#921297fa slot:int = consensus.BroadcastExtra;
 consensus.broadcastExtra flags:# slot:int delegation:flags.0?consensus.Delegation = consensus.BroadcastExtra;
 
