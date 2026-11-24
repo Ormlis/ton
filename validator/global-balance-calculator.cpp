@@ -220,8 +220,8 @@ td::actor::Task<std::shared_ptr<ParsedShardState>> ParsedShardState::fetch(
                 state_msg_queue.get_wrapped_dict_root()->get_hash());
 
     if (qinfo.extra.write().fetch_long(1) != 0) {
-      block::gen::OutMsgQueueExtra::Record queue_extra;
-      CO_TRY_BOOL(tlb::csr_unpack(qinfo.extra, queue_extra));
+      block::gen::OutMsgQueueData::Record queue_extra;
+      CO_TRY_BOOL(block::unpack_queue_extra(*qinfo.extra, queue_extra, &result->early_imports));
       vm::AugmentedDictionary dispatch_queue{queue_extra.dispatch_queue, 256, block::tlb::aug_DispatchQueue};
       block::tlb::DispatchQueueAugData::Record aug_data;
       CO_TRY_BOOL(tlb::csr_unpack_safe(dispatch_queue.get_root_extra(), aug_data));
@@ -476,6 +476,13 @@ td::actor::Task<GlobalInfo> compute_global_balance_from_states(
         TD_PERF_COUNTER(global_balance_compute_total_out_queue_balance);
         td::RefInt256 sum = td::zero_refint();
         size_t messages = 0;
+        // Each worker owns its dictionary views. The cells are immutable and shared across workers.
+        std::vector<std::pair<ShardIdFull, vm::Dictionary>> receipts;
+        for (const auto& peer : all_states) {
+          if (peer->early_imports.not_null()) {
+            receipts.emplace_back(peer->block_id.shard_full(), vm::Dictionary(peer->early_imports, 320));
+          }
+        }
         CO_TRY(state->msg_queue->check_for_each_extra(
             [&](Ref<vm::CellSlice> value, Ref<vm::CellSlice>, td::ConstBitPtr key, int key_len) {
               CHECK(key_len == 352);
@@ -484,6 +491,11 @@ td::actor::Task<GlobalInfo> compute_global_balance_from_states(
               TRY_BOOL(enq_msg_descr.unpack(value.write()) && enq_msg_descr.check_key(key));
               for (auto& proc : processed_upto) {
                 if (proc->already_processed(enq_msg_descr)) {
+                  return td::Status::OK();
+                }
+              }
+              for (auto& [owner, dict] : receipts) {
+                if (shard_contains(owner, enq_msg_descr.next_prefix_) && dict.lookup(key + 32, 320).not_null()) {
                   return td::Status::OK();
                 }
               }

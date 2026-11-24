@@ -1795,6 +1795,9 @@ bool InMsg::skip(vm::CellSlice& cs) const {
              && cs.advance(64)              // transaction_id:uint64
              && t_Grams.skip(cs)            // fwd_fee:Grams
              && t_RefCell.skip(cs);         // proof_delivered:^Cell
+    case msg_discard_group:
+      return cs.advance(5) && t_Ref_MsgEnvelope.skip(cs) && cs.advance(64);
+    case msg_import_group:
     case msg_import_deferred_fin:
       return cs.advance(5)                  // msg_import_deferred_fin$00100
              && t_Ref_MsgEnvelope.skip(cs)  // in_msg:^MsgEnvelope
@@ -1846,6 +1849,9 @@ bool InMsg::validate_skip(int* ops, vm::CellSlice& cs, bool weak) const {
              && cs.advance(64)                                  // transaction_id:uint64
              && t_Grams.validate_skip(ops, cs, weak)            // fwd_fee:Grams
              && t_RefCell.validate_skip(ops, cs, weak);         // proof_delivered:^Cell
+    case msg_discard_group:
+      return cs.advance(5) && t_Ref_MsgEnvelope.validate_skip(ops, cs, weak) && cs.advance(64);
+    case msg_import_group:
     case msg_import_deferred_fin:
       return cs.advance(5)                                      // msg_import_deferred_fin$00100
              && t_Ref_MsgEnvelope.validate_skip(ops, cs, weak)  // in_msg:^MsgEnvelope
@@ -1867,6 +1873,8 @@ static td::RefInt256 get_ihr_fee(const CommonMsgInfo::Record_int_msg_info& info,
 bool InMsg::get_import_fees(vm::CellBuilder& cb, vm::CellSlice& cs, int global_version) const {
   int tag = get_tag(cs);
   switch (tag) {
+    case msg_discard_group:  // The earlier import already accounted for value and fees.
+      return cs.have(5 + 64, 1) && t_ImportFees.null_value(cb);
     case msg_import_ext:                   // inbound external message
       return t_ImportFees.null_value(cb);  // external messages have no value and no import fees
     case msg_import_ihr:                   // IHR-forwarded internal message to its final destination
@@ -1880,6 +1888,7 @@ bool InMsg::get_import_fees(vm::CellBuilder& cb, vm::CellSlice& cs, int global_v
       }
       return false;
     case msg_import_fin:           // internal message delivered to its final destination in this block
+    case msg_import_group:
     case msg_import_deferred_fin:  // internal message from DispatchQueue to its final destination in this block
       if (cs.advance(tag == msg_import_fin ? 3 : 5) && cs.size_refs() >= 2) {
         auto msg_env_cs = load_cell_slice(cs.fetch_ref());

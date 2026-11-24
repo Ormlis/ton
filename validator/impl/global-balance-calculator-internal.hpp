@@ -30,6 +30,7 @@ struct ParsedShardState {
   std::unique_ptr<vm::AugmentedDictionary> msg_queue;
   std::unique_ptr<vm::AugmentedDictionary> dispatch_queue;  // optional - only if queue balance is not stored in state
   td::Ref<vm::CellSlice> proc_info;
+  td::Ref<vm::Cell> early_imports;
   td::RefInt256 accounts_balance = td::zero_refint();
   td::RefInt256 dispatch_queue_balance = td::zero_refint();
   td::RefInt256 mc_total_validator_fees = td::zero_refint();

@@ -809,7 +809,9 @@ struct InMsg final : TLB_Complex {
     msg_discard_fin = 6,
     msg_discard_tr = 7,
     msg_import_deferred_fin = 8,
-    msg_import_deferred_tr = 9
+    msg_import_deferred_tr = 9,
+    msg_import_group = 10,
+    msg_discard_group = 11
   };
   bool skip(vm::CellSlice& cs) const override;
   bool validate_skip(int* ops, vm::CellSlice& cs, bool weak = false) const override;

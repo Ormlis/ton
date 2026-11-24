@@ -35,6 +35,7 @@
 
 #include "block-parse.h"
 #include "fabric.h"
+#include "shard-group.h"
 #include "shard.hpp"
 #include "top-shard-descr.hpp"
 
@@ -132,7 +133,7 @@ class Collator final : public td::actor::Actor {
   ton::UnixTime prev_now_;
   ton::UnixTime now_upper_limit_{~0U};
   td::uint64 now_ms_;
-  unsigned out_msg_queue_ops_{}, in_descr_cnt_{}, out_descr_cnt_{};
+  unsigned out_msg_queue_ops_{}, early_import_ops_{}, in_descr_cnt_{}, out_descr_cnt_{};
   Ref<MasterchainStateQ> mc_state_;
   Ref<BlockData> prev_mc_block;
   BlockIdExt mc_block_id_;
@@ -206,6 +207,10 @@ class Collator final : public td::actor::Actor {
   td::CancellationTokenSource ext_msg_cancellation_;
 
   std::priority_queue<NewOutMsg, std::vector<NewOutMsg>, std::greater<NewOutMsg>> new_msgs;
+  ShardGroupExchange::Transfers group_exports_;
+  std::map<AccountIdPrefixFull, LogicalTime> group_last_import_lt_;
+  ShardGroupMessageOrder group_message_order_;
+  td::actor::Task<> process_group_messages();
   size_t new_msgs_from_dispatch = 0;
   std::pair<ton::LogicalTime, ton::Bits256> last_proc_int_msg_, first_unproc_int_msg_;
   block::tlb::Aug_InMsgDescr aug_InMsgDescr{0};
@@ -217,7 +222,7 @@ class Collator final : public td::actor::Actor {
   td::uint64 old_out_msg_queue_size_ = 0;
   td::uint64 out_msg_queue_size_hard_limit_ = std::numeric_limits<td::uint64>::max();
   bool have_out_msg_queue_size_in_state_ = false;
-  std::unique_ptr<vm::Dictionary> ihr_pending;
+  std::unique_ptr<vm::Dictionary> early_imports_;
   std::shared_ptr<block::MsgProcessedUptoCollection> processed_upto_, sibling_processed_upto_;
   std::unique_ptr<vm::Dictionary> block_create_stats_;
   std::map<td::Bits256, int> block_create_count_;
@@ -366,8 +371,8 @@ class Collator final : public td::actor::Actor {
   bool process_dispatch_queue();
   bool process_deferred_message(Ref<vm::CellSlice> enq_msg, StdSmcAddress src_addr, LogicalTime lt,
                                 td::optional<block::MsgMetadata>& msg_metadata);
-  bool enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_remaining, StdSmcAddress src_addr,
-                       bool defer = false);
+  bool enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_remaining, StdSmcAddress src_addr, bool defer,
+                       bool offer_to_group);
   bool enqueue_transit_message(Ref<vm::Cell> msg, Ref<vm::Cell> old_msg_env, ton::AccountIdPrefixFull prev_prefix,
                                ton::AccountIdPrefixFull cur_prefix, ton::AccountIdPrefixFull dest_prefix,
                                td::RefInt256 fwd_fee_remaining, td::optional<block::MsgMetadata> msg_metadata,
@@ -377,6 +382,7 @@ class Collator final : public td::actor::Actor {
   bool insert_out_msg(Ref<vm::Cell> out_msg);
   bool insert_out_msg(Ref<vm::Cell> out_msg, td::ConstBitPtr msg_hash);
   bool register_out_msg_queue_op(bool force = false);
+  bool register_early_import_op();
   bool register_dispatch_queue_op(bool force = false);
   bool update_account_dict_estimation(const block::transaction::Transaction& trans);
   void update_account_storage_dict_info(const block::transaction::Transaction& trans);

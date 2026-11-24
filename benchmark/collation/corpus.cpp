@@ -456,8 +456,8 @@ td::Status verify_empty_previous_state(const ton::BlockIdExt& id, const td::Ref<
   TRY_STATUS(verify_canonical_full_state(id, root, "previous shard state"));
   block::ShardState state;
   TRY_STATUS(state.unpack_state(id, root));
-  if (state.before_split_ || !state.out_msg_queue_ || !state.out_msg_queue_->is_empty() || !state.ihr_pending_ ||
-      !state.ihr_pending_->is_empty() || (state.out_msg_queue_size_ && state.out_msg_queue_size_.value() != 0)) {
+  if (state.before_split_ || !state.out_msg_queue_ || !state.out_msg_queue_->is_empty() || !state.early_imports_ ||
+      !state.early_imports_->is_empty() || (state.out_msg_queue_size_ && state.out_msg_queue_size_.value() != 0)) {
     return td::Status::Error("previous shard state violates the empty unsplit out-queue contract");
   }
   return td::Status::OK();

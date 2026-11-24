@@ -12,6 +12,7 @@ set(TON_VALIDATOR_SOURCE
   message-queue.cpp
   out-msg-queue-proof.cpp
   proof.cpp
+  shard-group.cpp
   shard.cpp
   top-shard-descr.cpp
   validate-query.cpp

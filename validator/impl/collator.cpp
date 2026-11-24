@@ -78,8 +78,6 @@ static constexpr td::uint32 MERGE_MAX_QUEUE_SIZE = 2047;
 static constexpr td::uint32 SKIP_EXTERNALS_QUEUE_SIZE = 8000;
 static constexpr int HIGH_PRIORITY_EXTERNAL = 10;  // don't skip high priority externals when queue is big
 
-static constexpr int MAX_ATTEMPTS = 5;
-
 /**
  * Constructs a Collator object.
  *
@@ -123,6 +121,9 @@ Collator::Collator(CollateParams params, td::actor::ActorId<ValidatorManager> ma
     external_msg_timeout_ = td::Timestamp::in(t * 0.75);
   }
   processed_external_messages_ = params_.processed_external_messages;
+  if (params_.group_message_order) {
+    group_message_order_ = *params_.group_message_order;
+  }
 }
 
 /**
@@ -384,11 +385,15 @@ std::string show_shard(const ton::ShardIdFull blk_id) {
  */
 bool Collator::fatal_error(td::Status error) {
   error.ensure_error();
+  if (!params_.group_exchange.empty()) {
+    td::actor::send_closure(params_.group_exchange, &ShardGroupExchange::cancel);
+    allow_repeat_collation_ = false;
+  }
   LOG(ERROR) << "cannot generate block candidate for " << show_shard(shard_) << " : " << error.to_string();
   if (busy_) {
     failed_with_ = error.clone();
-    if (allow_repeat_collation_ && error.code() != ErrorCode::cancelled && params_.attempt_idx + 1 < MAX_ATTEMPTS &&
-        !params_.is_hardfork && !timeout_.is_in_past()) {
+    if (allow_repeat_collation_ && error.code() != ErrorCode::cancelled &&
+        params_.attempt_idx + 1 < CollateParams::max_attempts && !params_.is_hardfork && !timeout_.is_in_past()) {
       CollateParams new_params = params_;
       ++new_params.attempt_idx;
       LOG(WARNING) << "Repeating collation (attempt #" << new_params.attempt_idx << ")";
@@ -727,6 +732,17 @@ void Collator::request_top_masterchain_state(BlockIdExt prev_mc_ref) {
   LOG(DEBUG) << "sending get_top_masterchain_state_block() to Manager";
   ++pending;
   auto token = perf_log_.start_action("get_top_masterchain_state_block");
+  if (params_.group_mc_state.not_null()) {
+    auto id = params_.group_mc_state->get_block_id();
+    if (id.seqno() < std::max(prev_mc_ref.seqno(), params_.min_masterchain_block_id.seqno()) ||
+        params_.group_mc_state->active_shard_group(shard_) != params_.group_members) {
+      fatal_error("Shard group masterchain reference is stale");
+      return;
+    }
+    td::actor::send_closure_later(get_self(), &Collator::after_get_mc_state, std::pair{params_.group_mc_state, id},
+                                  std::move(token));
+    return;
+  }
   if (params_.is_hardfork) {
     td::actor::send_closure_later(
         manager, &ValidatorManager::get_shard_state_from_db_short, params_.min_masterchain_block_id,
@@ -1372,7 +1388,7 @@ bool Collator::split_last_state(block::ShardState& ss) {
  *    total_balance_ = old_total_balance_, total_validator_fees_
  * SETS: overload_history_, underload_history_
  * SETS: prev_state_utime_, prev_state_lt_, prev_vert_seqno_
- * SETS: out_msg_queue, processed_upto_, ihr_pending
+ * SETS: out_msg_queue, processed_upto_, early_imports_
  *
  * @param ss The ShardState object containing the shard state data.
  *
@@ -1397,7 +1413,7 @@ bool Collator::import_shard_state_data(block::ShardState& ss) {
   out_msg_queue_ = std::move(ss.out_msg_queue_);
   old_out_msg_queue_ = std::make_unique<vm::AugmentedDictionary>(*out_msg_queue_);
   processed_upto_ = std::move(ss.processed_upto_);
-  ihr_pending = std::move(ss.ihr_pending_);
+  early_imports_ = std::move(ss.early_imports_);
   dispatch_queue_ = std::move(ss.dispatch_queue_);
   old_dispatch_queue_ = std::make_unique<vm::AugmentedDictionary>(*dispatch_queue_);
   block_create_stats_ = std::move(ss.block_create_stats_);
@@ -2498,7 +2514,14 @@ td::actor::Task<> Collator::do_collate_inner() {
   {
     td::ScopedRealCpuTimer::Guard timer{work_timer_total_, nullptr};
     // 5-6. import inbound external messages and process newly created messages (if space&gas left)
-    co_await process_external_and_new_messages();
+    if (params_.group_exchange.empty()) {
+      co_await process_external_and_new_messages();
+    } else {
+      if (!co_await process_inbound_external_messages()) {
+        co_return td::Status::Error("Cannot process external messages in shard group");
+      }
+      co_await process_group_messages();
+    }
   }
   auto post_ext_token = perf_log_.start_action("post_ext_processing");
   if (before_split_) {
@@ -3768,6 +3791,11 @@ int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, R
     }
   }
 
+  if (from_dispatch_queue && enqueue && !params_.group_exchange.empty()) {
+    ShardGroupMessageOrder::Route route{block::tlb::MsgAddressInt::get_prefix(src),
+                                        block::tlb::MsgAddressInt::get_prefix(dest)};
+    group_message_order_.record(route, msg.lt, false);
+  }
   if (enqueue || defer) {
     bool ok;
     if (from_dispatch_queue) {
@@ -3784,7 +3812,7 @@ int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, R
         LOG(INFO) << "deferring new message from account " << workchain() << ":" << src_addr.to_hex()
                   << ", lt=" << msg.lt << defer_reason;
       }
-      ok = enqueue_message(std::move(msg), std::move(fwd_fees), src_addr, defer);
+      ok = enqueue_message(std::move(msg), std::move(fwd_fees), src_addr, defer, !enqueue_only);
     }
     return ok ? 0 : -1;
   }
@@ -3800,6 +3828,9 @@ int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, R
   if (trans_root.is_null()) {
     fatal_error("cannot create transaction for re-processing output message");
     return -1;
+  }
+  if (!params_.group_exchange.empty()) {
+    group_last_import_lt_[block::tlb::MsgAddressInt::get_prefix(dest)] = msg.lt;
   }
   // 2. create a MsgEnvelope enveloping this Message
   block::tlb::MsgEnvelope::Record_std msg_env_rec{0x60, 0x60, fwd_fees, msg.msg, {}, msg.metadata};
@@ -3864,6 +3895,64 @@ int Collator::process_one_new_message(block::NewOutMsg msg, bool enqueue_only, R
     return 3;
   }
   return 1;
+}
+
+// Drain local work, then consume whatever peers have actually produced. A late or declined offer stays queued.
+td::actor::Task<> Collator::process_group_messages() {
+  std::set<ShardGroupMessageOrder::Route> declined;
+  auto can_execute = [&] {
+    return !block_full_ && inbound_queues_empty_ && !have_unprocessed_account_dispatch_queue_ &&
+           block_limit_status_->fits(block::ParamLimits::cl_normal) && !internal_msg_timeout_.is_in_past();
+  };
+  while (true) {
+    bool enqueue_only = !can_execute();
+    if (!process_new_messages(enqueue_only)) {
+      co_return td::Status::Error("Cannot process shard group outputs");
+    }
+    auto inbox = co_await td::actor::ask(params_.group_exchange, &ShardGroupExchange::exchange, shard_,
+                                         std::exchange(group_exports_, {}), !can_execute());
+    if (inbox.empty()) {
+      co_return td::Unit{};
+    }
+    std::sort(inbox.begin(), inbox.end(), [](const auto& a, const auto& b) {
+      return a.lt != b.lt ? a.lt < b.lt : a.envelope->get_hash() < b.envelope->get_hash();
+    });
+    // Outputs from this batch must follow every local output already offered to another member.
+    auto batch_floor = max_lt;
+    for (auto& offer : inbox) {
+      if (!can_execute()) {
+        break;
+      }
+      block::tlb::MsgEnvelope::Record_std env;
+      block::gen::CommonMsgInfo::Record_int_msg_info info;
+      if (!tlb::unpack_cell(offer.envelope, env) || !tlb::unpack_cell_inexact(env.msg, info)) {
+        co_return td::Status::Error("Invalid shard group envelope");
+      }
+      ShardGroupMessageOrder::Route route{block::tlb::MsgAddressInt::get_prefix(info.src),
+                                          block::tlb::MsgAddressInt::get_prefix(info.dest)};
+      auto floor = std::max(batch_floor, offer.lt);
+      if (declined.contains(route) || offer.lt < group_last_import_lt_[route.second] ||
+          floor - start_lt >= block_limits_->lt_delta.hard() - 1) {
+        declined.insert(route);
+        continue;
+      }
+      auto trans = create_ordinary_transaction(env.msg, env.metadata, floor, false);
+      LogicalTime trans_lt;
+      StdSmcAddress account;
+      vm::CellBuilder cb, receipt;
+      auto next = block::interpolate_addr(route.first, route.second, env.next_addr);
+      auto key = block::early_import_key(next, env.msg->get_hash().bits());
+      if (trans.is_null() || !block::get_transaction_id(trans, account, trans_lt) ||
+          !receipt.store_long_bool(trans_lt) ||
+          !early_imports_->set_builder(key, receipt, vm::Dictionary::SetMode::Add) || !cb.store_long_bool(0b00110, 5) ||
+          !cb.store_ref_bool(offer.envelope) || !cb.store_ref_bool(trans) ||
+          !block::tlb::t_Grams.store_integer_ref(cb, env.fwd_fee_remaining) || !insert_in_msg(cb.finalize()) ||
+          !register_early_import_op()) {
+        co_return td::Status::Error("Cannot record early shard group import");
+      }
+      group_last_import_lt_[route.second] = offer.lt;
+    }
+  }
 }
 
 /**
@@ -4149,33 +4238,26 @@ bool Collator::process_inbound_message(Ref<vm::CellSlice> enq_msg, ton::LogicalT
     ++neighbor_stats.skipped_msgs;
     return true;
   }
-  // 6.1. check whether we have already processed this message by IHR
-  //      (then create a msg_discard_fin InMsg and remove record from IhrPendingInfo)
-  // .. TODO ..
-  // 7. decide what to do with the message
-  if (!to_us) {
-    // destination is outside our shard, relay transit message
-    // (very similar to enqueue_message())
+  auto receipt = early_imports_->lookup_delete(key + 32, 320);
+  vm::CellBuilder cb;
+  if (receipt.not_null()) {
+    // The receipt follows the next hop across a split even if the final account is now in the other child.
+    FAIL_UNLESS(receipt->size_ext() == 64 && cb.store_long_bool(0b00111, 5) && cb.store_ref_bool(msg_env) &&
+                cb.append_cellslice_bool(*receipt) && register_early_import_op());
+  } else if (!to_us) {
     if (!enqueue_transit_message(std::move(env.msg), std::move(msg_env), cur_prefix, next_prefix, dest_prefix,
                                  std::move(env.fwd_fee_remaining), std::move(env.metadata), env.emitted_lt, false)) {
       return fatal_error("cannot enqueue transit internal message with key "s + key.to_hex(352));
     }
     return !our || delete_out_msg_queue_msg(key);
+  } else {
+    auto trans_root = create_ordinary_transaction(env.msg, env.metadata, 0);
+    if (!params_.group_exchange.empty()) {
+      group_last_import_lt_[dest_prefix] = lt;
+    }
+    FAIL_UNLESS(trans_root.not_null() && cb.store_long_bool(4, 3) && cb.store_ref_bool(msg_env) &&
+                cb.store_ref_bool(trans_root) && block::tlb::t_Grams.store_integer_ref(cb, env.fwd_fee_remaining));
   }
-  // destination is in our shard
-  // process the message by an ordinary transaction similarly to process_one_new_message()
-  //
-  // 8. create a Transaction processing this Message
-  auto trans_root = create_ordinary_transaction(env.msg, env.metadata, 0);
-  if (trans_root.is_null()) {
-    return fatal_error("cannot create transaction for processing inbound message");
-  }
-  // 9. create InMsg, referring to this MsgEnvelope and this Transaction
-  vm::CellBuilder cb;
-  FAIL_UNLESS(cb.store_long_bool(4, 3)                                               // msg_import_fin$100
-              && cb.store_ref_bool(msg_env)                                          // in_msg:^MsgEnvelope
-              && cb.store_ref_bool(trans_root)                                       // transaction:^Transaction
-              && block::tlb::t_Grams.store_integer_ref(cb, env.fwd_fee_remaining));  // fwd_fee:Grams
   Ref<vm::Cell> in_msg = cb.finalize();
   if (our) {
     // if the message originates from the output queue of current shard, create a msg_export_deq_imm record
@@ -4886,7 +4968,7 @@ bool Collator::insert_out_msg(Ref<vm::Cell> out_msg, td::ConstBitPtr msg_hash) {
  * @returns True if the message was successfully enqueued, false otherwise.
  */
 bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_remaining, StdSmcAddress src_addr,
-                               bool defer) {
+                               bool defer, bool offer_to_group) {
   LogicalTime enqueued_lt = msg.lt;
   FAIL_UNLESS(msg.msg_env_from_dispatch_queue.is_null());
   // 0. unpack src_addr and dest_addr
@@ -4907,6 +4989,7 @@ bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_rema
   if ((unsigned)route_info.first > 96 || (unsigned)route_info.second > 96) {
     return fatal_error("cannot perform hypercube routing for a new outbound message");
   }
+  auto next_hop = block::interpolate_addr(src_prefix, dest_prefix, route_info.second);
   // 2. create a new MsgEnvelope
   block::tlb::MsgEnvelope::Record_std msg_env_rec{
       defer ? 0 : route_info.first, defer ? 0 : route_info.second, fwd_fees_remaining, msg.msg, {}, msg.metadata};
@@ -4940,6 +5023,25 @@ bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_rema
   FAIL_UNLESS(cb.store_long_bool(enqueued_lt)  // _ enqueued_lt:uint64
               && cb.store_ref_bool(msg_env));  // out_msg:^MsgEnvelope = EnqueuedMsg;
 
+  // The offer is advisory. The committed export and its queue entry are identical with or without a recipient.
+  if (!params_.group_exchange.empty()) {
+    ShardGroupMessageOrder::Route route{src_prefix, dest_prefix};
+    for (auto peer : params_.group_members) {
+      if (peer != shard_ && shard_contains(peer, dest_prefix)) {
+        if (offer_to_group && !defer && shard_contains(peer, next_hop) &&
+            group_message_order_.can_deliver(route, msg.lt)) {
+          group_exports_.push_back({peer, msg.lt, msg_env});
+          if (group_exports_.size() == 32) {
+            td::actor::send_closure(params_.group_exchange, &ShardGroupExchange::publish,
+                                    std::exchange(group_exports_, {}));
+          }
+        } else {
+          group_message_order_.record(route, msg.lt, false);
+        }
+        break;
+      }
+    }
+  }
   // 6. insert EnqueuedMsg into OutMsgQueue (or DispatchQueue)
   if (defer) {
     block::AccountDispatchQueue account_queue;
@@ -4970,7 +5072,6 @@ bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_rema
     return register_dispatch_queue_op();
   }
 
-  auto next_hop = block::interpolate_addr(src_prefix, dest_prefix, route_info.second);
   td::BitArray<32 + 64 + 256> key;
   key.bits().store_int(next_hop.workchain, 32);
   (key.bits() + 32).store_int(next_hop.account_id_prefix, 64);
@@ -5870,6 +5971,10 @@ bool Collator::update_min_mc_seqno(ton::BlockSeqno some_mc_seqno) {
   return true;
 }
 
+bool Collator::register_early_import_op() {
+  return (++early_import_ops_ & 63) || block_limit_status_->add_proof(early_imports_->get_root_cell());
+}
+
 /**
  * Registers an output message queue operation.
  * Adds the proof to the block limit status every 64 operations.
@@ -6065,18 +6170,23 @@ bool Collator::compute_out_msg_queue_info(Ref<vm::Cell>& out_msg_queue_info) {
     };
   }
   vm::CellBuilder cb;
-  // out_msg_queue_extra#0 dispatch_queue:DispatchQueue out_queue_size:(Maybe uint48) = OutMsgQueueExtra;
-  // ... extra:(Maybe OutMsgQueueExtra)
-  if (!dispatch_queue_->is_empty() || store_out_msg_queue_size_) {
-    if (!(cb.store_long_bool(1, 1) && cb.store_long_bool(0, 4) && dispatch_queue_->append_dict_to_bool(cb))) {
+  bool has_receipts = !early_imports_->is_empty();
+  bool has_extra = has_receipts || !dispatch_queue_->is_empty() || store_out_msg_queue_size_;
+  if (!cb.store_bool_bool(has_extra)) {
+    return false;
+  }
+  if (has_extra) {
+    vm::CellBuilder data;
+    if (!dispatch_queue_->append_dict_to_bool(data) || !data.store_bool_bool(store_out_msg_queue_size_) ||
+        (store_out_msg_queue_size_ && !data.store_long_bool(out_msg_queue_size_, 48)) ||
+        !cb.store_long_bool(has_receipts ? 1 : 0, 4)) {
       return false;
     }
-    if (!(cb.store_bool_bool(store_out_msg_queue_size_) &&
-          (!store_out_msg_queue_size_ || cb.store_long_bool(out_msg_queue_size_, 48)))) {
-      return false;
-    }
-  } else {
-    if (!cb.store_long_bool(0, 1)) {
+    if (has_receipts) {
+      if (!cb.store_ref_bool(data.finalize()) || !cb.store_ref_bool(early_imports_->get_root_cell())) {
+        return false;
+      }
+    } else if (!cb.append_cellslice_bool(data.as_cellslice())) {
       return false;
     }
   }
@@ -6084,6 +6194,7 @@ bool Collator::compute_out_msg_queue_info(Ref<vm::Cell>& out_msg_queue_info) {
   cb.reset();
 
   return register_out_msg_queue_op(true) && register_dispatch_queue_op(true) &&
+         (!early_import_ops_ || block_limit_status_->add_proof(early_imports_->get_root_cell())) &&
          out_msg_queue_->append_dict_to_bool(cb)   // _ out_queue:OutMsgQueue
          && processed_upto_->pack(cb)              // proc_info:ProcessedInfo
          && cb.append_cellslice_bool(maybe_extra)  // extra:(Maybe OutMsgQueueExtra)

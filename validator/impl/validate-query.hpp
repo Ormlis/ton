@@ -35,6 +35,7 @@
 
 #include "block-parse.h"
 #include "fabric.h"
+#include "shard-group.h"
 #include "shard.hpp"
 
 namespace ton {
@@ -136,6 +137,9 @@ class ValidateQuery : public td::actor::Actor {
   std::vector<BlockIdExt> prev_blocks;
   std::vector<Ref<ShardState>> prev_states;
   BlockCandidate block_candidate;
+  std::shared_ptr<const ShardGroupMessages> group_messages_;
+  bool has_group_imports_ = false;
+  std::optional<ShardGroupMessageOrder> group_message_order_;
   td::Ref<block::ValidatorSet> validator_set_;
   PublicKeyHash local_validator_id_ = PublicKeyHash::zero();
   td::actor::ActorId<ValidatorManager> manager;
@@ -406,7 +410,7 @@ class ValidateQuery : public td::actor::Actor {
   bool update_min_enqueued_lt_hash(ton::LogicalTime lt, const ton::Bits256& hash);
   bool check_imported_message(Ref<vm::Cell> msg_env);
   bool is_special_in_msg(const vm::CellSlice& in_msg) const;
-  bool check_in_msg(td::ConstBitPtr key, Ref<vm::CellSlice> in_msg);
+  bool check_in_msg(td::ConstBitPtr key, Ref<vm::CellSlice> in_msg, vm::Dictionary& receipts);
   bool check_in_msg_descr();
   bool check_out_msg(td::ConstBitPtr key, Ref<vm::CellSlice> out_msg);
   bool check_out_msg_descr();

@@ -21,6 +21,7 @@
 #include "auto/tl/ton_api.hpp"
 #include "auto/tl/tonlib_api.hpp"
 #include "block/block-auto.h"
+#include "block/block.h"
 #include "block/check-proof.h"
 #include "common/util.h"
 #include "emulator/transaction-emulator.h"
@@ -1863,8 +1864,8 @@ class GetOutMsgQueueSizes : public td::actor::Actor {
         if (extra_slice.fetch_long(1) == 0) {
           return td::Status::Error("no out_msg_queue_size in shard state");
         }
-        block::gen::OutMsgQueueExtra::Record out_msg_queue_extra;
-        if (!tlb::unpack(extra_slice, out_msg_queue_extra)) {
+        block::gen::OutMsgQueueData::Record out_msg_queue_extra;
+        if (!block::unpack_queue_extra(extra_slice, out_msg_queue_extra)) {
           return td::Status::Error("cannot unpack OutMsgQueueExtra");
         }
         vm::CellSlice& size_slice = out_msg_queue_extra.out_queue_size.write();

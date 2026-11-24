@@ -430,6 +430,9 @@ struct CurrencyCollection {
 
 std::ostream& operator<<(std::ostream& os, const CurrencyCollection& cc);
 
+bool unpack_queue_extra(vm::CellSlice cs, gen::OutMsgQueueData::Record& data, Ref<vm::Cell>* early_imports = nullptr);
+td::BitArray<320> early_import_key(ton::AccountIdPrefixFull next, td::ConstBitPtr message_hash);
+
 struct ShardState {
   enum { verbosity = 0 };
   ton::BlockIdExt id_;
@@ -447,7 +450,7 @@ struct ShardState {
   td::uint64 overload_history_{0}, underload_history_{0};
   CurrencyCollection total_balance_, total_validator_fees_, global_balance_;
   std::unique_ptr<vm::AugmentedDictionary> out_msg_queue_;
-  std::unique_ptr<vm::Dictionary> ihr_pending_;
+  std::unique_ptr<vm::Dictionary> early_imports_;
   std::unique_ptr<vm::Dictionary> block_create_stats_;
   std::shared_ptr<block::MsgProcessedUptoCollection> processed_upto_;
   std::unique_ptr<vm::AugmentedDictionary> dispatch_queue_;

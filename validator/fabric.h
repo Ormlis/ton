@@ -28,7 +28,12 @@ namespace ton {
 
 namespace validator {
 
+class ShardGroupExchange;
+class ShardGroupMessageOrder;
+struct ShardGroupMessages;
+
 struct CollateParams {
+  static constexpr int max_attempts = 5;
   ShardIdFull shard;
   BlockIdExt min_masterchain_block_id;
   std::vector<BlockIdExt> prev;
@@ -51,6 +56,11 @@ struct CollateParams {
   std::vector<Ref<BlockData>> prev_block_data = {};
   std::vector<Ref<vm::Cell>> prev_block_state_roots = {};
 
+  td::actor::ActorId<ShardGroupExchange> group_exchange = {};
+  std::vector<ShardIdFull> group_members = {};
+  Ref<MasterchainState> group_mc_state = {};
+  std::shared_ptr<const ShardGroupMessageOrder> group_message_order = {};
+
   // Optional deterministic block seed for replay/benchmark tooling. Normal
   // production callers leave it empty and retain the collator's random seed.
   td::optional<td::Bits256> rand_seed = {};
@@ -70,6 +80,8 @@ struct ValidateParams {
   bool is_fake = false;
 
   bool parallel_validation = false;
+  std::shared_ptr<const ShardGroupMessages> group_messages = {};
+  std::shared_ptr<const ShardGroupMessageOrder> group_message_order = {};
 
   // Optional - if empty, states are taken from manager
   // If not empty, should be the same size as prev

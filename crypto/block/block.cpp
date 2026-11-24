@@ -780,7 +780,7 @@ double BlockLimitStatus::load_fraction(unsigned cls) const {
 
 // SETS: account_dict, shard_libraries_, mc_state_extra
 //    total_balance{,_extra}, total_validator_fees
-// SETS: out_msg_queue, processed_upto_, ihr_pending (via unpack_out_msg_queue_info)
+// SETS: out_msg_queue, processed_upto_, early_imports_ (via unpack_out_msg_queue_info)
 // SETS: utime_, lt_
 td::Status ShardState::unpack_state(ton::BlockIdExt blkid, Ref<vm::Cell> prev_state_root) {
   if (!blkid.is_valid()) {
@@ -888,7 +888,36 @@ td::Status ShardState::unpack_state(ton::BlockIdExt blkid, Ref<vm::Cell> prev_st
   return unpack_out_msg_queue_info(std::move(state.out_msg_queue_info));
 }
 
-// SETS: out_msg_queue, processed_upto_, ihr_pending
+// SETS: out_msg_queue, processed_upto_, early_imports_
+bool unpack_queue_extra(vm::CellSlice cs, gen::OutMsgQueueData::Record& data, Ref<vm::Cell>* early_imports) {
+  if (early_imports) {
+    early_imports->clear();
+  }
+  switch (cs.fetch_ulong(4)) {
+    case 0:
+      return tlb::unpack(cs, data) && cs.empty_ext();
+    case 1: {
+      if (cs.size() != 0 || cs.size_refs() != 2) {
+        return false;
+      }
+      auto queue_data = cs.fetch_ref();
+      if (early_imports) {
+        *early_imports = cs.fetch_ref();
+      }
+      return tlb::unpack_cell(queue_data, data);
+    }
+    default:
+      return false;
+  }
+}
+
+td::BitArray<320> early_import_key(ton::AccountIdPrefixFull next, td::ConstBitPtr message_hash) {
+  td::BitArray<320> key;
+  key.bits().store_uint(next.account_id_prefix, 64);
+  (key.bits() + 64).copy_from(message_hash, 256);
+  return key;
+}
+
 td::Status ShardState::unpack_out_msg_queue_info(Ref<vm::Cell> out_msg_queue_info) {
   block::gen::OutMsgQueueInfo::Record qinfo;
   if (!tlb::unpack_cell(std::move(out_msg_queue_info), qinfo)) {
@@ -907,11 +936,11 @@ td::Status ShardState::unpack_out_msg_queue_info(Ref<vm::Cell> out_msg_queue_inf
         -666, "ProcessedInfo in the state of "s + id_.to_str() + " is invalid according to automated validity checks");
   }
   processed_upto_ = block::MsgProcessedUptoCollection::unpack(ton::ShardIdFull(id_), std::move(qinfo.proc_info));
-  ihr_pending_ = std::make_unique<vm::Dictionary>(320);
+  Ref<vm::Cell> early_root;
   if (qinfo.extra.write().fetch_long(1)) {
-    block::gen::OutMsgQueueExtra::Record extra;
-    if (!block::tlb::csr_unpack(qinfo.extra, extra)) {
-      return td::Status::Error(-666, "cannot unpack OutMsgQueueExtre in the state of "s + id_.to_str());
+    block::gen::OutMsgQueueData::Record extra;
+    if (!unpack_queue_extra(*qinfo.extra, extra, &early_root)) {
+      return td::Status::Error(-666, "cannot unpack OutMsgQueueExtra in the state of "s + id_.to_str());
     }
     dispatch_queue_ = std::make_unique<vm::AugmentedDictionary>(extra.dispatch_queue, 256, tlb::aug_DispatchQueue);
     if (extra.out_queue_size.write().fetch_long(1)) {
@@ -920,11 +949,12 @@ td::Status ShardState::unpack_out_msg_queue_info(Ref<vm::Cell> out_msg_queue_inf
   } else {
     dispatch_queue_ = std::make_unique<vm::AugmentedDictionary>(256, tlb::aug_DispatchQueue);
   }
+  early_imports_ = std::make_unique<vm::Dictionary>(std::move(early_root), 320);
   auto shard1 = id_.shard_full();
   td::BitArray<64> pfx{(long long)shard1.shard};
   int pfx_len = shard_prefix_length(shard1);
-  if (!ihr_pending_->has_common_prefix(pfx.bits(), pfx_len)) {
-    return td::Status::Error(-666, "IhrPendingInfo in the state of "s + id_.to_str() + " does not have " +
+  if (!early_imports_->has_common_prefix(pfx.bits(), pfx_len)) {
+    return td::Status::Error(-666, "Early import receipts in the state of "s + id_.to_str() + " does not have " +
                                        pfx.bits().to_hex(pfx_len) + " as common key prefix");
   }
   return td::Status::OK();
@@ -1032,15 +1062,15 @@ td::Status ShardState::merge_with(ShardState& sib) {
     return td::Status::Error(-666, "cannot merge ProcessedUpto structures of the two ancestor states");
   }
   sib.processed_upto_.reset();
-  // 7. merge ihr_pending
-  LOG(DEBUG) << "merging IhrPendingInfo";
-  if (!ihr_pending_->combine_with(*sib.ihr_pending_)) {
-    return td::Status::Error(-666, "cannot merge IhrPendingInfo of the two ancestors");
+  // 7. merge early import receipts
+  LOG(DEBUG) << "merging early import receipts";
+  if (!early_imports_->combine_with(*sib.early_imports_)) {
+    return td::Status::Error(-666, "cannot merge early import receipts of the two ancestors");
   }
-  sib.ihr_pending_.reset();
-  // 7.1. check whether all keys of the new ihr_pending have correct prefix
-  if (!ihr_pending_->has_common_prefix(pfx.bits(), pfx_len)) {
-    return td::Status::Error(-666, "merged IhrPendingInfo of the two previous states of "s + shard.to_str() +
+  sib.early_imports_.reset();
+  // 7.1. check the merged next-hop key prefixes
+  if (!early_imports_->has_common_prefix(pfx.bits(), pfx_len)) {
+    return td::Status::Error(-666, "merged early import receipts of the two previous states of "s + shard.to_str() +
                                        " does not have " + pfx.bits().to_hex(pfx_len) + " as common key prefix");
   }
   // 8. compute merged utime_ and lt_
@@ -1138,10 +1168,10 @@ td::Status ShardState::split(ton::ShardIdFull subshard) {
   if (!processed_upto_->split(subshard)) {
     return td::Status::Error(-666, "error splitting ProcessedUpto of "s + id_.to_str());
   }
-  // 4. ihr_pending
-  LOG(DEBUG) << "splitting IhrPending";
-  CHECK(ihr_pending_->cut_prefix_subdict(pfx.bits(), pfx_len));
-  CHECK(ihr_pending_->has_common_prefix(pfx.bits(), pfx_len));
+  // 4. split early import receipts by the next hop of the original queue entry
+  LOG(DEBUG) << "splitting early import receipts";
+  CHECK(early_imports_->cut_prefix_subdict(pfx.bits(), pfx_len));
+  CHECK(early_imports_->has_common_prefix(pfx.bits(), pfx_len));
   // 5. adjust total_balance
   LOG(DEBUG) << "splitting total_balance";
   auto old_total_balance = total_balance_;

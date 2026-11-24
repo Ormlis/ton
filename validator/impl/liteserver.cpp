@@ -2444,7 +2444,7 @@ static td::Result<tl_object_ptr<lite_api::liteServer_transactionMetadata>> get_i
   }
   int tag = block::gen::t_InMsg.get_tag(*in_msg);
   if (tag != block::gen::InMsg::msg_import_imm && tag != block::gen::InMsg::msg_import_fin &&
-      tag != block::gen::InMsg::msg_import_deferred_fin) {
+      tag != block::gen::InMsg::msg_import_group && tag != block::gen::InMsg::msg_import_deferred_fin) {
     return nullptr;
   }
   Ref<vm::Cell> msg_env = in_msg->prefetch_ref();
@@ -2607,7 +2607,7 @@ static td::Status process_all_in_msg_metadata(const Ref<vm::Cell>& in_msg_descr_
     }
     int tag = block::gen::t_InMsg.get_tag(*in_msg);
     if (tag == block::gen::InMsg::msg_import_imm || tag == block::gen::InMsg::msg_import_fin ||
-        tag == block::gen::InMsg::msg_import_deferred_fin) {
+        tag == block::gen::InMsg::msg_import_group || tag == block::gen::InMsg::msg_import_deferred_fin) {
       Ref<vm::Cell> msg_env = in_msg->prefetch_ref();
       if (msg_env.is_null()) {
         return td::Status::Error(PSTRING() << "no MsgEnvelope in InMsg for message with hash " << in_msg_hash.to_hex());
@@ -3438,8 +3438,8 @@ void LiteQuery::finish_getBlockOutMsgQueueSize() {
     fatal_error("no out_msg_queue_size in shard state");
     return;
   }
-  block::gen::OutMsgQueueExtra::Record out_msg_queue_extra;
-  if (!tlb::unpack(extra_slice, out_msg_queue_extra)) {
+  block::gen::OutMsgQueueData::Record out_msg_queue_extra;
+  if (!block::unpack_queue_extra(extra_slice, out_msg_queue_extra)) {
     fatal_error("cannot unpack OutMsgQueueExtra");
     return;
   }
@@ -3502,14 +3502,14 @@ void LiteQuery::finish_getDispatchQueueInfo(StdSmcAddress after_addr, int max_ac
 
   block::gen::ShardStateUnsplit::Record sstate;
   block::gen::OutMsgQueueInfo::Record out_msg_queue_info;
-  block::gen::OutMsgQueueExtra::Record out_msg_queue_extra;
+  block::gen::OutMsgQueueData::Record out_msg_queue_extra;
   if (!tlb::unpack_cell(state_root, sstate) || !tlb::unpack_cell(sstate.out_msg_queue_info, out_msg_queue_info)) {
     fatal_error("cannot unpack shard state");
     return;
   }
   vm::CellSlice& extra_slice = out_msg_queue_info.extra.write();
   if (extra_slice.fetch_long(1)) {
-    if (!tlb::unpack(extra_slice, out_msg_queue_extra)) {
+    if (!block::unpack_queue_extra(extra_slice, out_msg_queue_extra)) {
       fatal_error("cannot unpack OutMsgQueueExtra");
       return;
     }
@@ -3609,14 +3609,14 @@ void LiteQuery::finish_getDispatchQueueMessages(StdSmcAddress addr, LogicalTime 
 
   block::gen::ShardStateUnsplit::Record sstate;
   block::gen::OutMsgQueueInfo::Record out_msg_queue_info;
-  block::gen::OutMsgQueueExtra::Record out_msg_queue_extra;
+  block::gen::OutMsgQueueData::Record out_msg_queue_extra;
   if (!tlb::unpack_cell(state_root, sstate) || !tlb::unpack_cell(sstate.out_msg_queue_info, out_msg_queue_info)) {
     fatal_error("cannot unpack shard state");
     return;
   }
   vm::CellSlice& extra_slice = out_msg_queue_info.extra.write();
   if (extra_slice.fetch_long(1)) {
-    if (!tlb::unpack(extra_slice, out_msg_queue_extra)) {
+    if (!block::unpack_queue_extra(extra_slice, out_msg_queue_extra)) {
       fatal_error("cannot unpack OutMsgQueueExtra");
       return;
     }

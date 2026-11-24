@@ -90,6 +90,8 @@ ValidateQuery::ValidateQuery(BlockCandidate candidate, ValidateParams params,
     , min_mc_block_id(params.min_masterchain_block_id)
     , prev_blocks(std::move(params.prev))
     , block_candidate(std::move(candidate))
+    , group_messages_(std::move(params.group_messages))
+    , group_message_order_(params.group_message_order ? std::optional{*params.group_message_order} : std::nullopt)
     , validator_set_(std::move(params.validator_set))
     , local_validator_id_(params.local_validator_id)
     , manager(manager)
@@ -1076,6 +1078,16 @@ bool ValidateQuery::try_unpack_mc_state() {
     }
     config_ = res.move_as_ok();
     REJECT_UNLESS(config_);
+    if (group_messages_) {
+      auto members = mc_state_->active_shard_group(shard_);
+      auto own = group_messages_->descriptors.find(shard_);
+      if (!group_message_order_ || own == group_messages_->descriptors.end() || own->second.block != id_ ||
+          members.empty() || members.size() != group_messages_->descriptors.size() ||
+          !std::all_of(members.begin(), members.end(),
+                       [&](auto id) { return group_messages_->descriptors.contains(id); })) {
+        return reject_query("Shard group differs from the referenced masterchain configuration");
+      }
+    }
     ihr_enabled_ = config_->ihr_enabled();
     create_stats_enabled_ = config_->create_stats_enabled();
     if (config_->has_capabilities() && (config_->get_capabilities() & ~supported_capabilities())) {
@@ -4083,7 +4095,7 @@ bool ValidateQuery::is_special_in_msg(const vm::CellSlice& in_msg) const {
  *
  * @returns True if the inbound message is valid, false otherwise.
  */
-bool ValidateQuery::check_in_msg(td::ConstBitPtr key, Ref<vm::CellSlice> in_msg) {
+bool ValidateQuery::check_in_msg(td::ConstBitPtr key, Ref<vm::CellSlice> in_msg, vm::Dictionary& receipts) {
   LOG(DEBUG) << "checking InMsg with key " << key.to_hex(256);
   REJECT_UNLESS(in_msg.not_null());
   int tag = block::gen::t_InMsg.get_tag(*in_msg);
@@ -4103,6 +4115,7 @@ bool ValidateQuery::check_in_msg(td::ConstBitPtr key, Ref<vm::CellSlice> in_msg)
   ton::AccountIdPrefixFull src_prefix, dest_prefix, cur_prefix, next_prefix;
   td::RefInt256 fwd_fee, orig_fwd_fee;
   bool from_dispatch_queue = false;
+  LogicalTime receipt_lt = 0;
   // initial checks and unpack
   switch (tag) {
     case block::gen::InMsg::msg_import_ext: {
@@ -4151,6 +4164,23 @@ bool ValidateQuery::check_in_msg(td::ConstBitPtr key, Ref<vm::CellSlice> in_msg)
         update_max_processed_lt_hash(created_lt, msg->get_hash().bits());
       }
       // ...
+      break;
+    }
+    case block::gen::InMsg::msg_discard_group: {
+      block::gen::InMsg::Record_msg_discard_group inp;
+      REJECT_UNLESS(tlb::csr_unpack(in_msg, inp) && tlb::unpack_cell(inp.in_msg, env));
+      msg_env = std::move(inp.in_msg);
+      msg = env.msg;
+      receipt_lt = inp.import_lt;
+      break;
+    }
+    case block::gen::InMsg::msg_import_group: {
+      block::gen::InMsg::Record_msg_import_group inp;
+      REJECT_UNLESS(group_messages_ && tlb::csr_unpack(in_msg, inp) && tlb::unpack_cell(inp.in_msg, env));
+      REJECT_UNLESS((fwd_fee = block::tlb::t_Grams.as_integer(std::move(inp.fwd_fee))).not_null());
+      transaction = std::move(inp.transaction);
+      msg_env = std::move(inp.in_msg);
+      msg = env.msg;
       break;
     }
     case block::gen::InMsg::msg_import_fin: {
@@ -4289,8 +4319,8 @@ bool ValidateQuery::check_in_msg(td::ConstBitPtr key, Ref<vm::CellSlice> in_msg)
     }
     // if a message is not processed by a transaction, its final destination must be outside this shard,
     // or it is a deferred message (dispatch queue -> out msg queue)
-    if (tag != block::gen::InMsg::msg_import_deferred_tr && transaction.is_null() &&
-        ton::shard_contains(shard_, dest_prefix)) {
+    if (tag != block::gen::InMsg::msg_import_deferred_tr && tag != block::gen::InMsg::msg_discard_group &&
+        transaction.is_null() && ton::shard_contains(shard_, dest_prefix)) {
       return reject_query("inbound internal message with hash "s + key.to_hex(256) + " has destination address " +
                           dest_prefix.to_str() + "... in this shard, but it is not processed by a transaction");
     }
@@ -4364,6 +4394,7 @@ bool ValidateQuery::check_in_msg(td::ConstBitPtr key, Ref<vm::CellSlice> in_msg)
     ton::StdSmcAddress trans_addr;
     ton::LogicalTime trans_lt;
     REJECT_UNLESS(block::get_transaction_id(transaction, trans_addr, trans_lt));
+    receipt_lt = trans_lt;
     if (dest_addr != trans_addr) {
       FLOG(INFO) {
         block::gen::t_InMsg.print(sb, in_msg);
@@ -4383,8 +4414,35 @@ bool ValidateQuery::check_in_msg(td::ConstBitPtr key, Ref<vm::CellSlice> in_msg)
   Ref<vm::Cell> reimport;
   bool tr_req = false;
 
-  // continue checking inbound message
+  auto receipt_key = block::early_import_key(next_prefix, key);
+  if (tag != block::gen::InMsg::msg_discard_group && !receipts.is_empty()) {
+    REJECT_UNLESS_MSG(receipts.lookup(receipt_key).is_null(), "Message was already executed by a shard group");
+  }
   switch (tag) {
+    case block::gen::InMsg::msg_import_group: {
+      REJECT_UNLESS(!shard_contains(shard_, src_prefix) && !env.emitted_lt && *fwd_fee == *env.fwd_fee_remaining);
+      REJECT_UNLESS_MSG(group_messages_->has_peer_record(src_prefix, false, key, *msg_env),
+                        "Early import has no corresponding new export in the certified group");
+      vm::CellBuilder value;
+      REJECT_UNLESS(receipt_lt > info.created_lt && value.store_long_bool(receipt_lt) &&
+                    receipts.set_builder(receipt_key, value, vm::Dictionary::SetMode::Add));
+      has_group_imports_ = true;
+      return true;
+    }
+    case block::gen::InMsg::msg_discard_group: {
+      auto previous = receipts.lookup_delete(receipt_key);
+      REJECT_UNLESS_MSG(previous.not_null() && previous->size_ext() == 64 && previous->prefetch_ulong(64) == receipt_lt,
+                        "Queued message has no matching early import receipt");
+      // This proves the exact queued envelope and advances the ordinary processed frontier.
+      REJECT_UNLESS(check_imported_message(msg_env));
+      if (shard_contains(shard_, cur_prefix)) {
+        block::gen::OutMsg::Record_msg_export_deq_imm out;
+        REJECT_UNLESS(tlb::csr_unpack_safe(out_msg_dict_->lookup(key, 256), out));
+        reimport = std::move(out.reimport);
+        out_msg_env = std::move(out.out_msg);
+      }
+      break;
+    }
     case block::gen::InMsg::msg_import_imm: {
       // msg_import_imm$011 in_msg:^MsgEnvelope transaction:^Transaction fwd_fee:Grams
       // importing and processing an internal message generated in this very block
@@ -4633,15 +4691,18 @@ bool ValidateQuery::check_in_msg_descr() {
   LOG(INFO) << "checking inbound messages listed in InMsgDescr";
   try {
     REJECT_UNLESS(in_msg_dict_);
+    vm::Dictionary receipts(ps_.early_imports_->get_root_cell(), 320);
     if (!in_msg_dict_->validate_check_extra(
-            [this](Ref<vm::CellSlice> value, Ref<vm::CellSlice> extra, td::ConstBitPtr key, int key_len) {
+            [this, &receipts](Ref<vm::CellSlice> value, Ref<vm::CellSlice> extra, td::ConstBitPtr key, int key_len) {
               REJECT_UNLESS(key_len == 256);
-              return check_in_msg(key, std::move(value)) ||
+              return check_in_msg(key, std::move(value), receipts) ||
                      reject_query("invalid InMsg with key (message hash) "s + key.to_hex(256) + " in the new block "s +
                                   id_.to_str());
             })) {
       return reject_query("invalid InMsgDescr dictionary in the new block "s + id_.to_str());
     }
+    REJECT_UNLESS_MSG(receipts.get_root()->contents_equal(*ns_.early_imports_->get_root()),
+                      "Early import receipts differ from the verified imports and discards");
   } catch (vm::VmError& err) {
     return reject_query("invalid InMsgDescr dictionary: "s + err.get_msg());
   }
@@ -4954,6 +5015,17 @@ bool ValidateQuery::check_out_msg(td::ConstBitPtr key, Ref<vm::CellSlice> out_ms
     return true;  // nothing to check more for external messages
   }
 
+  if (group_messages_ &&
+      (tag == block::gen::OutMsg::msg_export_new || tag == block::gen::OutMsg::msg_export_deferred_tr ||
+       tag == block::gen::OutMsg::msg_export_new_defer)) {
+    unsigned long long lt;
+    REJECT_UNLESS(block::tlb::t_MsgEnvelope.get_emitted_lt(vm::load_cell_slice(msg_env), lt));
+    bool early = tag == block::gen::OutMsg::msg_export_new && !shard_contains(shard_, dest_prefix) &&
+                 group_messages_->has_peer_record(dest_prefix, true, key, *msg_env);
+    REJECT_UNLESS_MSG(group_message_order_->record({src_prefix, dest_prefix}, lt, early),
+                      "Direct shard group message bypasses an earlier queued message");
+  }
+
   // check the OutMsgQueue update effected by this OutMsg
   td::BitArray<32 + 64 + 256> q_key;
   q_key.bits().store_int(next_prefix.workchain, 32);
@@ -5044,7 +5116,8 @@ bool ValidateQuery::check_out_msg(td::ConstBitPtr key, Ref<vm::CellSlice> out_ms
     // NB: in check_in_msg(), we have already checked that all InMsg have correct keys (equal to the hash of the imported message), so the imported message is equal to the exported message (they have the same hash)
     // have only to check the envelope
     int i_tag = block::gen::t_InMsg.get_tag(*in);
-    if (i_tag < 0 || i_tag != in_tag) {
+    bool discard = tag == block::gen::OutMsg::msg_export_deq_imm && i_tag == block::gen::InMsg::msg_discard_group;
+    if (i_tag < 0 || (i_tag != in_tag && !discard)) {
       return reject_query("OutMsg with key "s + key.to_hex(256) +
                           " refers to a (re)import InMsg, which is not one of msg_import_imm, msg_import_fin, "
                           "msg_import_tr or msg_import_deferred_tr as expected");
@@ -5250,18 +5323,8 @@ bool ValidateQuery::check_out_msg(td::ConstBitPtr key, Ref<vm::CellSlice> out_ms
       break;
     }
     case block::gen::OutMsg::msg_export_deq_imm: {
-      block::gen::InMsg::Record_msg_import_fin in;
-      block::tlb::MsgEnvelope::Record_std in_env;
-      if (!(tlb::unpack_cell(reimport, in) && tlb::unpack_cell(in.in_msg, in_env))) {
-        return reject_query(
-            "cannot unpack msg_import_fin InMsg record corresponding to msg_export_deq_imm OutMsg record with key "s +
-            key.to_hex(256));
-      }
-      if (in.in_msg->get_hash() != msg_env->get_hash()) {
-        return reject_query("msg_import_fin InMsg record corresponding to msg_export_deq_imm OutMsg record with key "s +
-                            key.to_hex(256) +
-                            " somehow imported a different MsgEnvelope from that dequeued by msg_export_deq_imm");
-      }
+      auto in = vm::load_cell_slice(reimport);
+      REJECT_UNLESS(in.prefetch_ref()->get_hash() == msg_env->get_hash());
       if (!shard_contains(shard_, cur_prefix)) {
         return reject_query("msg_export_deq_imm OutMsg record with key "s + key.to_hex(256) +
                             " dequeued a MsgEnvelope with current address " + cur_prefix.to_str() +
@@ -5269,8 +5332,8 @@ bool ValidateQuery::check_out_msg(td::ConstBitPtr key, Ref<vm::CellSlice> out_ms
       }
       // we have already checked more conditions in check_in_msg() case msg_import_fin
       REJECT_UNLESS(shard_contains(shard_, next_prefix));  // sanity check
-      REJECT_UNLESS(shard_contains(shard_, dest_prefix));  // sanity check
-      // ...
+      REJECT_UNLESS(block::gen::t_InMsg.get_tag(in) == block::gen::InMsg::msg_discard_group ||
+                    shard_contains(shard_, dest_prefix));
       break;
     }
     default:
@@ -5518,7 +5581,8 @@ bool ValidateQuery::check_neighbor_outbound_message(Ref<vm::CellSlice> enq_msg, 
                           " which is claimed to be processed by new ProcessedInfo of this block");
     }
     int tag = block::gen::t_InMsg.get_tag(*in_entry);
-    if (tag != block::gen::InMsg::msg_import_fin && tag != block::gen::InMsg::msg_import_tr) {
+    if (tag != block::gen::InMsg::msg_import_fin && tag != block::gen::InMsg::msg_import_tr &&
+        tag != block::gen::InMsg::msg_discard_group) {
       return reject_query(
           "expected either a msg_import_fin or a msg_import_tr InMsg record for processing EnqueuedMsg with key "s +
           key.to_hex(352) + " of neighbor " + nb.blk_.to_str() +
@@ -5535,7 +5599,8 @@ bool ValidateQuery::check_neighbor_outbound_message(Ref<vm::CellSlice> enq_msg, 
   }
   if (in_entry.not_null()) {
     int tag = block::gen::t_InMsg.get_tag(*in_entry);
-    if (tag == block::gen::InMsg::msg_import_fin || tag == block::gen::InMsg::msg_import_tr) {
+    if (tag == block::gen::InMsg::msg_import_fin || tag == block::gen::InMsg::msg_import_tr ||
+        tag == block::gen::InMsg::msg_discard_group) {
       return reject_query("there is an InMsg entry for EnqueuedMsg with key "s + key.to_hex(352) + " of neighbor " +
                           nb.blk_.to_str() + ", but new ProcessedInfo does not mark this message as processed");
     }
@@ -5562,12 +5627,13 @@ bool ValidateQuery::check_in_queue() {
   int imported_messages_count = 0;
   in_msg_dict_->check_for_each_extra([&](Ref<vm::CellSlice> value, Ref<vm::CellSlice>, td::ConstBitPtr, int) {
     int tag = block::gen::t_InMsg.get_tag(*value);
-    if (tag == block::gen::InMsg::msg_import_fin || tag == block::gen::InMsg::msg_import_tr) {
+    if (tag == block::gen::InMsg::msg_import_fin || tag == block::gen::InMsg::msg_import_tr ||
+        tag == block::gen::InMsg::msg_discard_group) {
       ++imported_messages_count;
     }
     return true;
   });
-  if (imported_messages_count == 0 && claimed_proc_lt_ == 0) {
+  if (!has_group_imports_ && imported_messages_count == 0 && claimed_proc_lt_ == 0) {
     return true;
   }
 
@@ -5610,10 +5676,14 @@ bool ValidateQuery::check_in_queue() {
       --imported_messages_count;
     }
     auto msg_lt = kv->lt;
-    if (imported_messages_count == 0 && msg_lt == claimed_proc_lt_ && msg_hash == claimed_proc_hash_) {
+    if (!has_group_imports_ && imported_messages_count == 0 && msg_lt == claimed_proc_lt_ &&
+        msg_hash == claimed_proc_hash_) {
       return true;
     }
     if (unprocessed) {
+      if (has_group_imports_) {
+        return reject_query("A shard group message bypassed pending inbound messages");
+      }
       if (imported_messages_count) {
         return reject_query(PSTRING() << "there are still " << imported_messages_count
                                       << " imported internal messages listed in InMsgDescr that are not reflected in "
@@ -5837,7 +5907,7 @@ bool ValidateQuery::CheckAccountTxs::check_one_transaction(block::Account& accou
     auto in_msg_tag = block::gen::t_InMsg.get_tag(*in_descr_cs);
     if (in_msg_tag != block::gen::InMsg::msg_import_ext && in_msg_tag != block::gen::InMsg::msg_import_fin &&
         in_msg_tag != block::gen::InMsg::msg_import_imm && in_msg_tag != block::gen::InMsg::msg_import_ihr &&
-        in_msg_tag != block::gen::InMsg::msg_import_deferred_fin) {
+        in_msg_tag != block::gen::InMsg::msg_import_group && in_msg_tag != block::gen::InMsg::msg_import_deferred_fin) {
       return reject_query(PSTRING() << "inbound message with hash " << in_msg_root->get_hash().to_hex()
                                     << " of transaction " << lt << " of account " << addr.to_hex()
                                     << " has an invalid InMsg record (not one of msg_import_ext, msg_import_fin, "
@@ -5857,8 +5927,8 @@ bool ValidateQuery::CheckAccountTxs::check_one_transaction(block::Account& accou
       block::gen::CommonMsgInfo::Record_int_msg_info info;
       REJECT_UNLESS(tlb::unpack_cell_inexact(in_msg_root, info));
       LogicalTime emitted_lt = info.created_lt;  // See ValidateQuery::check_message_processing_order
-      if (in_msg_tag == block::gen::InMsg::msg_import_imm || in_msg_tag == block::gen::InMsg::msg_import_fin ||
-          in_msg_tag == block::gen::InMsg::msg_import_deferred_fin) {
+      if (in_msg_tag == block::gen::InMsg::msg_import_group || in_msg_tag == block::gen::InMsg::msg_import_imm ||
+          in_msg_tag == block::gen::InMsg::msg_import_fin || in_msg_tag == block::gen::InMsg::msg_import_deferred_fin) {
         block::tlb::MsgEnvelope::Record_std msg_env;
         if (!block::tlb::unpack_cell(in_descr_cs->prefetch_ref(), msg_env)) {
           return reject_query(PSTRING() << "InMsg record for inbound message with hash "
@@ -6951,13 +7021,6 @@ bool ValidateQuery::check_new_state() {
                   << " but the value computed from all shard references and previous masterchain block reference is "
                   << ref_mc_seqno << " = min(" << my_mc_seqno << "," << min_shard_ref_mc_seqno_ << ","
                   << ns_.processed_upto_->min_mc_seqno() << ")");
-  }
-  // out_msg_queue_info:^OutMsgQueueInfo
-  // -> _ out_queue:OutMsgQueue proc_info:ProcessedInfo
-  //      ihr_pending:IhrPendingInfo = OutMsgQueueInfo;
-  if (!ns_.ihr_pending_->is_empty()) {
-    return reject_query("IhrPendingInfo in the new state of "s + id_.to_str() +
-                        " is non-empty, but IHR delivery is now disabled");
   }
   // before_split:(## 1) -> checked in unpack_next_state()
   // accounts:^ShardAccounts -> checked in precheck_account_updates() + other

@@ -207,6 +207,8 @@ msg_discard_tr$111 in_msg:^MsgEnvelope transaction_id:uint64
     fwd_fee:Grams proof_delivered:^Cell = InMsg;
 msg_import_deferred_fin$00100 in_msg:^MsgEnvelope
     transaction:^Transaction fwd_fee:Grams = InMsg;
+msg_import_group$00110 in_msg:^MsgEnvelope transaction:^Transaction fwd_fee:Grams = InMsg;
+msg_discard_group$00111 in_msg:^MsgEnvelope import_lt:uint64 = InMsg;
 msg_import_deferred_tr$00101 in_msg:^MsgEnvelope out_msg:^MsgEnvelope = InMsg;
 //
 import_fees$_ fees_collected:Grams
@@ -258,7 +260,10 @@ dispatch_queue_aug$10 min_created_lt:uint64 total_balance:CurrencyCollection = D
 // key - sender address
 _ (HashmapAugE 256 AccountDispatchQueue DispatchQueueAugData) = DispatchQueue;
 
-out_msg_queue_extra#0 dispatch_queue:DispatchQueue out_queue_size:(Maybe uint48) = OutMsgQueueExtra;
+_ dispatch_queue:DispatchQueue out_queue_size:(Maybe uint48) = OutMsgQueueData;
+out_msg_queue_extra#0 data:OutMsgQueueData = OutMsgQueueExtra;
+// Key: next-hop account prefix followed by the original message hash. Value: early transaction lt.
+out_msg_queue_extra_group#1 data:^OutMsgQueueData early_imports:^(Hashmap 320 uint64) = OutMsgQueueExtra;
 
 _ out_queue:OutMsgQueue proc_info:ProcessedInfo
   extra:(Maybe OutMsgQueueExtra) = OutMsgQueueInfo;
