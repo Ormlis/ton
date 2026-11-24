@@ -167,6 +167,11 @@ class TonlibClient:
         request = tonlib_api.Blocks_getShardsRequest(id=block_id)
         return request.parse_result(await self._tonlib_wrapper.execute(request))
 
+    async def get_block_data(self, block_id: tonlib_api.Ton_blockIdExt) -> bytes:
+        assert self._tonlib_wrapper is not None
+        request = tonlib_api.Blocks_getBlockRequest(id=block_id)
+        return request.parse_result(await self._tonlib_wrapper.execute(request)).data
+
     async def get_block_header(
         self, block_id: tonlib_api.Ton_blockIdExt
     ) -> tonlib_api.Blocks_header:

@@ -38,6 +38,7 @@
 #include "validator/fabric.h"
 #include "validator/global-balance-calculator.hpp"
 #include "validator/impl/global-balance-calculator-internal.hpp"
+#include "validator/impl/shard-group.h"
 #include "vm/cells/MerkleUpdate.h"
 
 namespace ton::validator {
@@ -239,10 +240,11 @@ td::Ref<vm::Cell> make_test_shard_accounts(ShardIdFull shard) {
 }
 
 td::Ref<vm::Cell> make_test_out_msg_queue_info(const vm::AugmentedDictionary& msg_queue,
-                                               const vm::AugmentedDictionary* dispatch_queue) {
+                                               const vm::AugmentedDictionary* dispatch_queue,
+                                               block::MsgProcessedUptoCollection* processed = nullptr) {
   vm::CellBuilder cb;
   CHECK(cb.append_cellslice_bool(vm::load_cell_slice_ref(msg_queue.get_wrapped_dict_root())));
-  CHECK(cb.store_zeroes_bool(1));  // empty ProcessedInfo
+  CHECK(processed ? processed->pack(cb) : cb.store_zeroes_bool(1));
   if (dispatch_queue == nullptr) {
     CHECK(cb.store_zeroes_bool(1));  // extra:nothing$0
   } else {
@@ -257,7 +259,8 @@ td::Ref<vm::Cell> make_test_out_msg_queue_info(const vm::AugmentedDictionary& ms
 }
 
 td::Ref<vm::Cell> make_test_shard_state_root(BlockIdExt block_id, const vm::AugmentedDictionary& msg_queue,
-                                             const vm::AugmentedDictionary* dispatch_queue) {
+                                             const vm::AugmentedDictionary* dispatch_queue,
+                                             block::MsgProcessedUptoCollection* processed = nullptr) {
   vm::CellBuilder cb;
   CHECK(cb.store_long_bool(0x9023afe2, 32));
   CHECK(cb.store_long_bool(0, 32));  // global_id
@@ -267,7 +270,7 @@ td::Ref<vm::Cell> make_test_shard_state_root(BlockIdExt block_id, const vm::Augm
   CHECK(cb.store_zeroes_bool(32));  // gen_utime
   CHECK(cb.store_zeroes_bool(64));  // gen_lt
   CHECK(cb.store_zeroes_bool(32));  // min_ref_mc_seqno
-  CHECK(cb.store_ref_bool(make_test_out_msg_queue_info(msg_queue, dispatch_queue)));
+  CHECK(cb.store_ref_bool(make_test_out_msg_queue_info(msg_queue, dispatch_queue, processed)));
   CHECK(cb.store_zeroes_bool(1));  // before_split
   CHECK(cb.store_ref_bool(make_test_shard_accounts(block_id.shard_full())));
 
@@ -470,6 +473,48 @@ TEST(GlobalBalanceCalculator, FetchRegular) {
   // The two stored message balances are again (100 + 7) + (200 + 11) = 318.
   expect_int(stored->dispatch_queue_balance, 318);
   CHECK(stored->dispatch_queue == nullptr);
+}
+
+TEST(ShardGroups, QueuedCopyUsesReferencedMasterchainState) {
+  ShardIdFull group{basechainId}, a = shard_child(group, true), b = shard_child(group, false);
+  ShardGroupMessageOrder::Route route{{basechainId, 0}, {basechainId, b.shard}};
+  auto msg = make_internal_message(0, b.shard, 100, 0, 3, 50);
+  auto queue = make_out_queue();
+  add_out_queue_entry(*queue, msg, b.shard, 54, make_envelope(msg, 3));
+  block::MsgProcessedUptoCollection frontier{b};
+  CHECK(frontier.insert(7, 50, msg->get_hash().bits()));
+  ShardGroupMessageOrder parents;
+  parents.add_parent(make_test_shard_state_root(make_block_id(a, 3), *queue, nullptr), group).ensure();
+  parents.add_parent(make_test_shard_state_root(make_block_id(b, 3), *make_out_queue(), nullptr, &frontier), group)
+      .ensure();
+  for (LogicalTime end_lt : {54, 55}) {
+    auto order = parents;
+    order.set_shard_end_lt(8, [](auto) { return 100; });
+    order.set_shard_end_lt(7, [=](auto) { return end_lt; });
+    order.index_parents();
+    CHECK(order.can_deliver(route, 70) == (end_lt > 54));
+  }
+}
+
+TEST(GlobalBalanceCalculator, EarlyReceiptFollowsQueueOnSplit) {
+  AccountIdPrefixFull src{basechainId, 0}, dest{basechainId, 0x8800000000000000ULL};
+  auto sender = shard_prefix(src.as_leaf_shard(), 4);
+  auto receiver = shard_prefix(dest.as_leaf_shard(), 4);
+  auto next = block::interpolate_addr(src, dest, block::perform_hypercube_routing(src, dest, sender).second);
+  CHECK(shard_contains(shard_child(receiver, true), next) && shard_contains(shard_child(receiver, false), dest));
+  auto id = make_block_id(receiver, 1);
+  auto root = make_test_shard_state_root(id, *make_out_queue(), nullptr);
+  auto key = block::early_import_key(next, root->get_hash().bits());
+  block::ShardState left, right;
+  for (auto* state : {&left, &right}) {
+    state->unpack_state(id, root).ensure();
+    CHECK(state->early_imports_->set_builder(key, vm::CellBuilder{}.store_long(51, 64)));
+  }
+  left.split(shard_child(receiver, true)).ensure();
+  right.split(shard_child(receiver, false)).ensure();
+  CHECK(left.early_imports_->lookup(key).not_null() && right.early_imports_->is_empty());
+  left.merge_with(right).ensure();
+  CHECK(left.early_imports_->lookup_delete(key)->prefetch_ulong(64) == 51 && left.early_imports_->is_empty());
 }
 
 TEST(GlobalBalanceCalculator, FetchSplit) {

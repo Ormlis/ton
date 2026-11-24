@@ -2,7 +2,7 @@ import hashlib
 import json
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Never, cast, override
 
@@ -39,6 +39,7 @@ from block.generated import (
     block_grams_created,
     block_limits,
     capabilities,
+    catchain_config_groups,
     catchain_config_new,
     cfg_vote_cfg,
     cfg_vote_setup,
@@ -161,6 +162,7 @@ class SimplexConsensusConfig:
 class NetworkConfig:
     monitor_min_split: int = 0
     split: int = 0
+    shard_group_levels: int = 0
     global_version: int = 14
     # Include capFullCollatedData in param 8 so shard-block validation runs
     # purely from collated-data proofs (no celldb state reads); mainnet parity.
@@ -628,18 +630,21 @@ def _build_config_params(
     )
 
     # Param 28: catchain config
-    params.append(
-        ConfigParam_28(
-            field=catchain_config_new(
-                flags=0,
-                shuffle_mc_validators=True,
-                mc_catchain_lifetime=config.mc_valgroup_lifetime,
-                shard_catchain_lifetime=config.shard_valgroup_lifetime,
-                shard_validators_lifetime=1000,
-                shard_validators_num=config.shard_validators,
-            )
-        )
+    catchain = catchain_config_new(
+        flags=0,
+        shuffle_mc_validators=True,
+        mc_catchain_lifetime=config.mc_valgroup_lifetime,
+        shard_catchain_lifetime=config.shard_valgroup_lifetime,
+        shard_validators_lifetime=1000,
+        shard_validators_num=config.shard_validators,
     )
+    if config.shard_group_levels:
+        if not 1 <= config.shard_group_levels <= min(3, config.split):
+            raise ValueError("Shard group levels must be 1..3 and fit within the split depth")
+        catchain = catchain_config_groups(
+            **asdict(catchain), member_depth=config.split, group_levels=config.shard_group_levels
+        )
+    params.append(ConfigParam_28(field=catchain))
 
     # Param 29: consensus config
     params.append(
