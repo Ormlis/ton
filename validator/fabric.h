@@ -18,6 +18,8 @@
 */
 #pragma once
 
+#include <algorithm>
+
 #include "interfaces/db.h"
 #include "interfaces/validator-manager.h"
 #include "td/actor/coro_utils.h"
@@ -50,6 +52,15 @@ struct CollateParams {
   td::Timestamp hard_timeout = td::Timestamp::in(10.0);
   td::Timestamp soft_timeout = {};
   td::Timestamp wait_externals_until = {};
+
+  td::Timestamp external_msg_timeout() const {
+    auto soft = soft_timeout ? soft_timeout : hard_timeout;
+    if (wait_externals_until) {
+      return std::max(wait_externals_until, soft);
+    }
+    auto now = td::Timestamp::now();
+    return now + (soft - now) * 0.75;
+  }
 
   // Optional - if empty, blocks and states are taken from manager
   // If not empty, should be the same size as prev

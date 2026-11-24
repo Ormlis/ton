@@ -182,6 +182,9 @@ void ShardGroupExchange::external_queue_ready(ShardIdFull member, bool closed) {
 }
 
 void ShardGroupExchange::offer(Transfer transfer) {
+  if (input_deadline_.is_in_past()) {
+    return;
+  }
   auto& destination = members_[transfer.destination];
   if (destination.finished || !destination.accept_transfers) {
     return;
@@ -212,7 +215,7 @@ void ShardGroupExchange::wait_for_work(ShardIdFull member, bool accept_transfers
 
 void ShardGroupExchange::dispatch() {
   external_wait_.pause();
-  bool past_cutoff = external_deadline_ && external_deadline_.is_in_past();
+  bool past_cutoff = input_deadline_.is_in_past();
   size_t idle = 0;
   bool waiting_for_externals = false;
   for (auto& [_, state] : members_) {
@@ -237,7 +240,7 @@ void ShardGroupExchange::dispatch() {
       ++idle;
       if (state.accept_externals && !state.closed) {
         waiting_for_externals = true;
-      } else if (!state.accept_transfers) {
+      } else if (past_cutoff || !state.accept_transfers) {
         state.finished = true;
         state.waiter.set_value({{}, {}, external_wait_.elapsed()});
       }
@@ -248,7 +251,6 @@ void ShardGroupExchange::dispatch() {
   }
   if (waiting_for_externals) {
     external_wait_.resume();
-    alarm_timestamp().relax(external_deadline_);
     return;
   }
   for (auto& [_, state] : members_) {

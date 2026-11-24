@@ -110,15 +110,13 @@ Collator::Collator(CollateParams params, td::actor::ActorId<ValidatorManager> ma
   if (!params_.soft_timeout) {
     params_.soft_timeout = params_.hard_timeout;
   }
+  external_msg_timeout_ = params_.external_msg_timeout();
   if (params_.wait_externals_until) {
-    queue_cleanup_timeout_ = std::max(params_.wait_externals_until, params_.soft_timeout);
-    internal_msg_timeout_ = std::max(params_.wait_externals_until, params_.soft_timeout);
-    external_msg_timeout_ = std::max(params_.wait_externals_until, params_.soft_timeout);
+    queue_cleanup_timeout_ = internal_msg_timeout_ = external_msg_timeout_;
   } else {
     double t = params_.soft_timeout.in();
     queue_cleanup_timeout_ = td::Timestamp::in(t * 0.25);
     internal_msg_timeout_ = td::Timestamp::in(t * 0.5);
-    external_msg_timeout_ = td::Timestamp::in(t * 0.75);
   }
   processed_external_messages_ = params_.processed_external_messages;
   if (params_.group_message_order) {
@@ -3974,7 +3972,7 @@ td::actor::Task<> Collator::process_group_messages() {
   std::set<ShardGroupMessageOrder::Route> declined;
   auto can_execute = [&] {
     return !block_full_ && inbound_queues_empty_ && !have_unprocessed_account_dispatch_queue_ &&
-           block_limit_status_->fits(block::ParamLimits::cl_normal) && !internal_msg_timeout_.is_in_past();
+           block_limit_status_->fits(block::ParamLimits::cl_normal) && !external_msg_timeout_.is_in_past();
   };
   LogicalTime external_floor = 0;
   while (true) {
@@ -5139,7 +5137,8 @@ bool Collator::enqueue_message(block::NewOutMsg msg, td::RefInt256 fwd_fees_rema
     ShardGroupMessageOrder::Route route{src_prefix, dest_prefix};
     for (auto peer : params_.group_members) {
       if (peer != shard_ && shard_contains(peer, dest_prefix)) {
-        if (offer_to_group && !defer && shard_contains(peer, next_hop) &&
+        auto deadline = params_.wait_externals_until ? params_.wait_externals_until : external_msg_timeout_;
+        if (offer_to_group && !defer && !deadline.is_in_past() && shard_contains(peer, next_hop) &&
             group_message_order_.can_deliver(route, msg.lt)) {
           // Reading a UsageCell on the receiver would update the sender's proof builder.
           auto envelope = clean_usage_cells(std::move(msg_env));

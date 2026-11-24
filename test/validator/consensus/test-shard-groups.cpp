@@ -104,12 +104,42 @@ TEST(ShardGroups, LateExternalWakesAnIdleGroup) {
   });
 }
 
+TEST(ShardGroups, InputDeadlineWhilePeerIsBusy) {
+  using Exchange = ShardGroupExchange;
+  td::actor::TestScheduler scheduler;
+  scheduler.run([&]() -> td::actor::Task<> {
+    auto idle = shard_child(ShardIdFull{basechainId}, true), busy = shard_sibling(idle);
+    auto cutoff = td::Timestamp::in(1);
+    auto exchange = td::actor::create_actor<Exchange>("exchange", 2, cutoff);
+    auto next = [&](ShardIdFull shard) {
+      return td::actor::ask(exchange, &Exchange::wait_for_work, shard, true, false);
+    };
+    auto offer = [&](LogicalTime lt) {
+      td::actor::send_closure_later(exchange, &Exchange::offer, Exchange::Transfer{busy, lt, {}});
+    };
+    offer(1);
+    auto waiting = next(idle);
+    co_await scheduler.wait_sync_work();
+    ASSERT_TRUE(!waiting.await_ready());
+    scheduler.advance_time_to(cutoff);
+    co_await scheduler.wait_sync_work();
+    ASSERT_TRUE(waiting.await_ready());
+    ASSERT_TRUE((co_await std::move(waiting)).transfers.empty());
+    offer(2);
+    auto buffered = co_await next(busy);
+    ASSERT_EQ(1u, buffered.transfers.size());
+    ASSERT_EQ(1u, buffered.transfers[0].lt);
+    ASSERT_TRUE((co_await next(busy)).transfers.empty());
+    co_return td::Unit{};
+  });
+}
+
 TEST(ShardGroups, PeerPreemptsBufferedExternals) {
   using Exchange = ShardGroupExchange;
   td::actor::TestScheduler scheduler;
   scheduler.run([&]() -> td::actor::Task<> {
     ShardIdFull receiver{basechainId};
-    auto exchange = td::actor::create_actor<Exchange>("exchange", 1);
+    auto exchange = td::actor::create_actor<Exchange>("exchange", 1, td::Timestamp::in(1));
     auto next = [&] { return td::actor::ask(exchange, &Exchange::wait_for_work, receiver, true, true); };
     auto offer = [&](LogicalTime lt) {
       td::actor::send_closure_later(exchange, &Exchange::offer, Exchange::Transfer{receiver, lt, {}});

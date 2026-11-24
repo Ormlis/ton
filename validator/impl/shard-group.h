@@ -17,7 +17,7 @@ namespace ton::validator {
 // Include the validator's receipt lookup in the proof of the previous state.
 bool visit_early_import_receipt(vm::Dictionary& previous_receipts, Ref<vm::Cell> envelope);
 
-// Idle members can receive peer transfers while any member still has an open external input.
+// Peer transfers and live externals share an input deadline. Buffered work can still be drained afterwards.
 class ShardGroupExchange final : public td::actor::Actor {
  public:
   struct Transfer {
@@ -33,8 +33,7 @@ class ShardGroupExchange final : public td::actor::Actor {
     double wait_externals_time = 0;  // Total time all members were idle, returned on completion.
   };
 
-  explicit ShardGroupExchange(size_t size, td::Timestamp external_deadline = {})
-      : size_(size), external_deadline_(external_deadline) {
+  ShardGroupExchange(size_t size, td::Timestamp input_deadline) : size_(size), input_deadline_(input_deadline) {
   }
   void external_queue_ready(ShardIdFull member, bool closed);
   void offer(Transfer transfer);
@@ -54,10 +53,13 @@ class ShardGroupExchange final : public td::actor::Actor {
     bool finished = false;
   };
   size_t size_;
-  const td::Timestamp external_deadline_;
+  const td::Timestamp input_deadline_;
   td::Timer external_wait_{true};
   std::map<ShardIdFull, Member> members_;
   void dispatch();
+  void start_up() override {
+    alarm_timestamp() = input_deadline_;
+  }
   void alarm() override {
     dispatch();
   }
