@@ -9,8 +9,8 @@
 #include "td/utils/overloaded.h"
 
 #include "bus.h"
-#include "checksum.h"
 #include "payload.h"
+#include "types.h"
 
 namespace ton::validator::consensus {
 
@@ -29,7 +29,7 @@ bool check_consensus_signature(const PublicKey& key, ValidatorSessionId session,
   if (encryptor.is_error()) {
     return false;
   }
-  return encryptor.move_as_ok()->check_signature(signed_data, signature).is_ok();
+  return encryptor.move_as_ok()->check_signature(signed_data, signature, td::SignatureDomain::Consensus).is_ok();
 }
 
 bool PeerValidator::check_signature(ValidatorSessionId session, td::Slice data, td::Slice signature) const {
@@ -182,6 +182,7 @@ td::Result<CandidateRef> Candidate::deserialize_data(tl::CandidateDataRef broadc
   };
   td::Result<ExtractedData> maybe_data;
 
+  std::vector<CandidateRootsRef> roots;
   PeerValidator leader;
   auto set_check_leader = [&](td::uint32 slot) -> td::Status {
     if (expected_slot.has_value() && expected_slot != slot) {
@@ -207,10 +208,11 @@ td::Result<CandidateRef> Candidate::deserialize_data(tl::CandidateDataRef broadc
   };
 
   auto decode_member = [&](td::Slice payload, ShardIdFull shard) -> td::Result<BlockCandidate> {
-    TRY_RESULT(candidate, deserialize_payload(payload, static_cast<int>(std::min<td::uint64>(
-                                                           0x7fffffff, td::uint64(bus.config.max_block_size) +
-                                                                           bus.config.max_collated_data_size + 1024))));
+    TRY_RESULT(decoded, deserialize_payload(payload, static_cast<int>(std::min<td::uint64>(
+                                                         0x7fffffff, td::uint64(bus.config.max_block_size) +
+                                                                         bus.config.max_collated_data_size + 1024))));
 
+    auto& candidate = decoded.payload;
     if (!candidate->src_.is_zero()) {
       return td::Status::Error("src field of the candidate broadcast must be null");
     }
@@ -224,10 +226,11 @@ td::Result<CandidateRef> Candidate::deserialize_data(tl::CandidateDataRef broadc
     BlockIdExt block_id{
         BlockId{shard, static_cast<BlockSeqno>(candidate->round_)},
         candidate->root_hash_,
-        td::sha256_bits256(candidate->data_.as_slice()),
+        decoded.roots->block_file_hash,
     };
 
-    auto collated_file_hash = td::sha256_bits256(candidate->collated_data_.as_slice());
+    auto collated_file_hash = decoded.roots->collated_file_hash;
+    roots.push_back(std::move(decoded.roots));
 
     Ed25519_PublicKey creator{leader.key.ed25519_value().raw()};
 
@@ -291,7 +294,7 @@ td::Result<CandidateRef> Candidate::deserialize_data(tl::CandidateDataRef broadc
   }
 
   return td::make_ref<Candidate>(id, parsed.parent_id, leader.idx, std::move(parsed.block), std::move(parsed.signature),
-                                 std::move(delegation));
+                                 std::move(delegation), std::vector<td::BufferSlice>{}, std::move(roots));
 }
 
 BlockIdExt Candidate::block_id() const {
@@ -306,17 +309,18 @@ CandidateHashData Candidate::hash_data() const {
   return CandidateHashData::from(block, parent_id);
 }
 
-td::Result<td::BufferSlice> Candidate::encode_block(const BlockCandidate& candidate) {
-  return serialize_payload(
+td::Result<td::BufferSlice> Candidate::encode_block(const BlockCandidate& candidate, CandidateRootsRef roots) {
+  auto payload =
       create_tl_object<ton_api::validatorSession_candidate>(td::Bits256{}, candidate.id.seqno(), candidate.id.root_hash,
-                                                            candidate.data.clone(), candidate.collated_data.clone()));
+                                                            candidate.data.clone(), candidate.collated_data.clone());
+  return serialize_payload({std::move(payload), std::move(roots)});
 }
 
 std::vector<td::BufferSlice> Candidate::encoded_blocks() const {
   std::vector<td::BufferSlice> payloads;
   if (encoded_members_.empty()) {
-    for (const auto& member : blocks()) {
-      payloads.push_back(encode_block(member).move_as_ok());
+    for (size_t i = 0; i < blocks().size(); ++i) {
+      payloads.push_back(encode_block(blocks()[i], roots_for(i)).move_as_ok());
     }
   } else {
     for (const auto& encoded : encoded_members_) {

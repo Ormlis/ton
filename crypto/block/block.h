@@ -289,6 +289,7 @@ struct BlockLimitStatus {
   vm::NewCellStorageStat st_stat;
   vm::MerkleUpdateLeftStat merkle_update_left_stat;
   unsigned accounts{}, transactions{}, extra_out_msgs{};
+  td::uint64 pending_msg_descrs = 0;
   td::uint64 collated_data_size_estimate = 0;
   unsigned public_library_diff{};
   BlockLimitStatus(const BlockLimits& limits_, ton::LogicalTime lt = 0)
@@ -300,6 +301,7 @@ struct BlockLimitStatus {
     transactions = accounts = 0;
     gas_used = 0;
     extra_out_msgs = 0;
+    pending_msg_descrs = 0;
     public_library_diff = 0;
     collated_data_size_estimate = 0;
   }
@@ -406,7 +408,7 @@ struct CurrencyCollection {
   CurrencyCollection operator-(td::RefInt256 other_grams) const;
   bool clamp(const CurrencyCollection& other);
   bool check_extra_currency_limit(td::uint32 max_currencies) const;
-  static bool remove_zero_extra_currencies(Ref<vm::Cell>& root, td::uint32 max_currencies);
+  static td::Status validate_normalize_extra_currencies(Ref<vm::Cell>& root, td::uint32 max_currencies);
   bool store(vm::CellBuilder& cb) const;
   bool store_or_zero(vm::CellBuilder& cb) const;
   bool fetch(vm::CellSlice& cs);

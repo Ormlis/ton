@@ -97,8 +97,9 @@ struct ShardGroupMessages {
     Ref<vm::Cell> in, out;
   };
   std::map<ShardIdFull, Descriptors> descriptors;
-  static td::Result<std::shared_ptr<const ShardGroupMessages>> extract(const std::vector<BlockCandidate>& blocks,
-                                                                       const std::vector<ShardIdFull>& members);
+  static td::Result<std::shared_ptr<const ShardGroupMessages>> extract(
+      const std::vector<BlockCandidate>& blocks, const std::vector<ShardIdFull>& members,
+      const std::vector<CandidateRootsRef>& roots = {});
   bool has_peer_record(AccountIdPrefixFull peer, bool incoming, td::ConstBitPtr key, const vm::Cell& envelope) const;
 };
 

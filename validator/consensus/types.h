@@ -11,6 +11,7 @@
 #include "adnl/adnl-node-id.hpp"
 #include "keys/keys.hpp"
 #include "ton/ton-types.h"
+#include "validator/candidate-roots.h"
 
 namespace ton::validator::consensus {
 
@@ -163,25 +164,30 @@ struct Candidate : td::CntObject {
   static td::Result<td::Ref<Candidate>> deserialize_broadcast_data(tl::CandidateDataRef data, Signer signer,
                                                                    const Bus& bus, td::uint32 expected_slot);
   std::vector<td::BufferSlice> encoded_blocks() const;
-  static td::Result<td::BufferSlice> encode_block(const BlockCandidate& block);
+  static td::Result<td::BufferSlice> encode_block(const BlockCandidate& block, CandidateRootsRef roots = {});
 
   Candidate(CandidateId id, ParentId parent_id, PeerValidatorId leader, CandidateContents block,
             td::BufferSlice signature, std::optional<Delegation> delegation = std::nullopt,
-            std::vector<td::BufferSlice> encoded_members = {})
+            std::vector<td::BufferSlice> encoded_members = {}, std::vector<CandidateRootsRef> member_roots = {})
       : encoded_members_(std::move(encoded_members))
       , id(id)
       , parent_id(std::move(parent_id))
       , leader(leader)
       , block(std::move(block))
       , signature(std::move(signature))
-      , delegation(std::move(delegation)) {
-    CHECK(std::holds_alternative<CandidateBlocks>(this->block) || this->parent_id.has_value());
+      , delegation(std::move(delegation))
+      , member_roots(std::move(member_roots)) {
+    CHECK(!is_empty() || this->parent_id.has_value());
+    CHECK(this->member_roots.empty() || (!is_empty() && this->member_roots.size() == blocks().size()));
   }
 
   BlockIdExt block_id() const;
   BlockReferences block_ids() const;
   const CandidateBlocks& blocks() const {
     return std::get<CandidateBlocks>(block);
+  }
+  CandidateRootsRef roots_for(size_t i) const {
+    return member_roots.empty() ? CandidateRootsRef{} : member_roots.at(i);
   }
   CandidateHashData hash_data() const;
   td::BufferSlice serialize() const;
@@ -205,6 +211,7 @@ struct Candidate : td::CntObject {
   CandidateContents block;
   td::BufferSlice signature;
   std::optional<Delegation> delegation;
+  std::vector<CandidateRootsRef> member_roots;  // In shard order when decoded from the wire.
 };
 
 using CandidateRef = td::Ref<Candidate>;

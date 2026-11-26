@@ -72,8 +72,10 @@ struct CandidateReceived {
 struct ValidationRequest {
   using ReturnType = ValidateCandidateResult;
 
-  ChainStateRef state;
   CandidateRef candidate;
+  std::vector<BlockIdExt> prev_block_ids;
+  ChainStateRef prev_state;  // optional for an ordinary shard with full collated data
+  bool is_prev_normal_tip;
 
   std::string contents_to_string() const;
   static std::string response_to_string(const ReturnType&);
@@ -259,6 +261,10 @@ class Bus : public td::actor::Bus {
   std::unique_ptr<Db> db;
 
   td::Promise<td::Unit> stop_promise;
+
+  bool is_masterchain() const {
+    return shard.is_masterchain();
+  }
 };
 
 using BusHandle = td::actor::BusHandle<Bus>;

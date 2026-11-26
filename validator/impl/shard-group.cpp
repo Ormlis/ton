@@ -268,7 +268,9 @@ void ShardGroupExchange::cancel() {
 }
 
 td::Result<std::shared_ptr<const ShardGroupMessages>> ShardGroupMessages::extract(
-    const std::vector<BlockCandidate>& blocks, const std::vector<ShardIdFull>& members) {
+    const std::vector<BlockCandidate>& blocks, const std::vector<ShardIdFull>& members,
+    const std::vector<CandidateRootsRef>& roots) {
+  CHECK(roots.empty() || roots.size() == blocks.size());
   if (members.empty() || members.size() != blocks.size()) {
     return td::Status::Error("Incomplete shard group");
   }
@@ -278,7 +280,12 @@ td::Result<std::shared_ptr<const ShardGroupMessages>> ShardGroupMessages::extrac
   try {
     for (size_t i = 0; i < members.size(); ++i) {
       const auto& candidate = blocks[i];
-      TRY_RESULT(root, vm::std_boc_deserialize(candidate.data));
+      Ref<vm::Cell> root;
+      if (roots.empty()) {
+        TRY_RESULT_ASSIGN(root, vm::std_boc_deserialize(candidate.data));
+      } else {
+        root = roots[i]->block_root;
+      }
       block::gen::Block::Record blk;
       block::gen::BlockInfo::Record info;
       block::gen::BlockExtra::Record extra;

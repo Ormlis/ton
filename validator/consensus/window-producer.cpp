@@ -134,7 +134,6 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
       block_generation_target_slot = slot;
       CollateParams params{
           .shard = bus.shard,
-          .min_masterchain_block_id = state->min_mc_block_id(),
           .prev = {},
           .creator = Ed25519_PublicKey{ctx.leader.key.ed25519_value().raw()},
           .first_in_window = slot == ctx.start_slot,

@@ -747,7 +747,7 @@ td::uint64 BlockLimitStatus::estimate_block_size(const vm::NewCellStorageStat::S
     sum += *extra;
   }
   return 2000 + (sum.bits >> 3) + sum.cells * 12 + sum.internal_refs * 3 + sum.external_refs * 40 + transactions * 200 +
-         (extra ? 200 : 0) + extra_out_msgs * 300 + public_library_diff * 700 +
+         (extra ? 200 : 0) + extra_out_msgs * 300 + public_library_diff * 700 + pending_msg_descrs * 160 +
          merkle_update_left_stat.estimate_proof_size();
 }
 
@@ -1424,25 +1424,34 @@ bool CurrencyCollection::check_extra_currency_limit(td::uint32 max_currencies) c
   });
 }
 
-bool CurrencyCollection::remove_zero_extra_currencies(Ref<vm::Cell>& root, td::uint32 max_currencies) {
-  td::uint32 count = 0;
-  vm::Dictionary dict{root, 32};
-  int res = dict.filter([&](const vm::CellSlice& cs, td::ConstBitPtr, int) -> int {
-    ++count;
-    if (count > max_currencies) {
-      return -1;
-    }
-    td::RefInt256 val = tlb::t_VarUInteger_32.as_integer(cs);
-    if (val.is_null()) {
-      return -1;
-    }
-    return val->sgn() > 0;
-  });
-  if (res < 0) {
-    return false;
+td::Status CurrencyCollection::validate_normalize_extra_currencies(Ref<vm::Cell>& root, td::uint32 max_currencies) {
+  if (max_currencies == 0) {
+    return root.is_null() ? td::Status::OK() : td::Status::Error("no extra currencies allowed");
   }
-  root = dict.get_root_cell();
-  return true;
+  try {
+    td::uint32 count = 0;
+    vm::Dictionary dict{root, 32};
+    td::Status S = td::Status::OK();
+    dict.filter([&](const vm::CellSlice& cs, td::ConstBitPtr, int) -> int {
+      ++count;
+      if (count > max_currencies) {
+        S = td::Status::Error("too many extra currencies");
+        return -1;
+      }
+      td::RefInt256 val = tlb::t_VarUInteger_32.as_integer(cs);
+      if (val.is_null()) {
+        S = td::Status::Error("failed to parse value");
+        return -1;
+      }
+      return val->sgn() > 0;
+    });
+    if (S.is_ok()) {
+      root = dict.get_root_cell();
+    }
+    return S;
+  } catch (vm::VmError&) {
+    return td::Status::Error("invalid dict");
+  }
 }
 
 bool CurrencyCollection::operator==(const CurrencyCollection& other) const {

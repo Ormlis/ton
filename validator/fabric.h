@@ -24,6 +24,7 @@
 #include "interfaces/validator-manager.h"
 #include "td/actor/coro_utils.h"
 
+#include "candidate-roots.h"
 #include "validator.h"
 
 namespace ton {
@@ -37,7 +38,7 @@ struct ShardGroupMessages;
 struct CollateParams {
   static constexpr int max_attempts = 5;
   ShardIdFull shard;
-  BlockIdExt min_masterchain_block_id;
+  BlockIdExt min_masterchain_block_id = {};
   std::vector<BlockIdExt> prev;
   bool is_hardfork = false;
   bool is_fake = false;
@@ -83,13 +84,13 @@ struct CollateParams {
 
 struct ValidateParams {
   ShardIdFull shard;
-  BlockIdExt min_masterchain_block_id;
+  BlockIdExt min_masterchain_block_id = {};
   std::vector<BlockIdExt> prev;
   td::Ref<block::ValidatorSet> validator_set = {};
   PublicKeyHash local_validator_id = PublicKeyHash::zero();
 
   bool is_fake = false;
-
+  bool require_full_collated_data = false;
   bool parallel_validation = false;
   std::shared_ptr<const ShardGroupMessages> group_messages = {};
   std::shared_ptr<const ShardGroupMessageOrder> group_message_order = {};
@@ -97,6 +98,9 @@ struct ValidateParams {
   // Optional - if empty, states are taken from manager
   // If not empty, should be the same size as prev
   std::vector<Ref<vm::Cell>> prev_block_state_roots = {};
+
+  // Optional roots retained from candidate deserialization
+  CandidateRootsRef candidate_roots = {};
 };
 
 td::actor::ActorOwn<Db> create_db_actor(td::actor::ActorId<ValidatorManager> manager, std::string db_root_,
@@ -104,7 +108,7 @@ td::actor::ActorOwn<Db> create_db_actor(td::actor::ActorId<ValidatorManager> man
 td::actor::ActorOwn<LiteServerCache> create_liteserver_cache_actor(td::actor::ActorId<ValidatorManager> manager,
                                                                    std::string db_root);
 
-td::Result<td::Ref<BlockData>> create_block(BlockIdExt block_id, td::BufferSlice data);
+td::Result<td::Ref<BlockData>> create_block(BlockIdExt block_id, td::BufferSlice data, td::Ref<vm::Cell> root = {});
 td::Result<td::Ref<BlockData>> create_block(ReceivedBlock data);
 td::Result<td::Ref<Proof>> create_proof(BlockIdExt masterchain_block_id, td::BufferSlice proof);
 td::Result<td::Ref<ProofLink>> create_proof_link(BlockIdExt block_id, td::BufferSlice proof);

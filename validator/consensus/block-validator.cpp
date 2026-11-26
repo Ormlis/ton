@@ -72,7 +72,7 @@ class BlockValidatorImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
     owning_bus().publish<TraceEvent>(stats::ValidationStarted::create(event->candidate->id));
 
     auto empty_fn = [&](const BlockReferences& refs) -> td::actor::Task<ValidateCandidateResult> {
-      if (!event->state->as_normal() || refs != event->state->block_ids()) {
+      if (!event->is_prev_normal_tip || refs != event->prev_block_ids) {
         co_return CandidateReject{
             .reason = "Wrong referenced block in empty candidate",
             .proof = td::BufferSlice(),
@@ -82,31 +82,38 @@ class BlockValidatorImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
     };
     auto block_fn = [&](const CandidateBlocks& blocks) -> td::actor::Task<ValidateCandidateResult> {
       if (bus.shard.is_masterchain()) {
-        auto expected_seqno = event->state->as_normal();
-        while (last_accepted_block_ < expected_seqno) {
+        if (event->prev_block_ids.size() != 1) {
+          co_return td::Status::Error(PSTRING() << "Invalid prev blocks for candidate " << event->candidate->id);
+        }
+        std::optional<BlockIdExt> expected =
+            event->is_prev_normal_tip ? std::optional{event->prev_block_ids[0]} : std::nullopt;
+        while (last_accepted_block_ < expected) {
           auto [awaiter, promise] = td::actor::StartedTask<>::make_bridge();
           next_block_promises_.push_back(std::move(promise));
           co_await std::move(awaiter);
         }
-        if (expected_seqno < last_accepted_block_) {
-          co_return td::Status::Error(PSTRING()
-                                      << "Candidate " << event->candidate->id << " builds upon " << expected_seqno
-                                      << " but we already finalized " << last_accepted_block_);
+        if (expected < last_accepted_block_) {
+          co_return td::Status::Error(PSTRING() << "Candidate " << event->candidate->id << " builds upon " << expected
+                                                << " but we already finalized " << last_accepted_block_);
         }
       }
 
+      if (event->prev_state.is_null() &&
+          (bus.is_masterchain() || !bus.config.full_collated_data_enabled || !bus.group_members.empty())) {
+        co_return td::Status::Error("Missing parent state for candidate");
+      }
       std::shared_ptr<const ShardGroupMessages> messages;
       std::shared_ptr<const ShardGroupMessageOrder> order;
       if (!bus.group_members.empty()) {
-        auto view = ShardGroupMessages::extract(blocks, bus.group_members);
+        auto view = ShardGroupMessages::extract(blocks, bus.group_members, event->candidate->member_roots);
         if (view.is_error()) {
           co_return CandidateReject{view.move_as_error().to_string(), {}};
         }
         messages = view.move_as_ok();
-        order = co_await event->state->group_message_order(bus.manager);
+        order = co_await event->prev_state->group_message_order(bus.manager);
         std::optional<double> timestamp;
-        for (const auto& block : blocks) {
-          auto t = get_candidate_gen_utime_exact(block);
+        for (size_t i = 0; i < blocks.size(); ++i) {
+          auto t = get_candidate_gen_utime_exact(blocks[i], event->candidate->roots_for(i));
           if (t.is_error() || (timestamp && *timestamp != t.ok())) {
             co_return CandidateReject{"Different generation times in shard group", {}};
           }
@@ -115,15 +122,16 @@ class BlockValidatorImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
       }
       std::vector<td::actor::StartedTask<ValidateCandidateResult>> validations;
       for (size_t i = 0; i < blocks.size(); ++i) {
-        const ChainState& state = event->state->member(i);
+        const auto* state = event->prev_state.not_null() ? &event->prev_state->member(i) : nullptr;
         ValidateParams params{
             .shard = bus.group_members.empty() ? bus.shard : bus.group_members[i],
-            .min_masterchain_block_id = state.min_mc_block_id(),
-            .prev = state.block_ids(),
+            .prev = state ? state->block_ids() : event->prev_block_ids,
             .local_validator_id = bus.local_id->short_id,
+            .require_full_collated_data = bus.config.full_collated_data_enabled,
             .group_messages = messages,
             .group_message_order = order,
-            .prev_block_state_roots = state.state(),
+            .prev_block_state_roots = state ? state->state() : std::vector<Ref<vm::Cell>>{},
+            .candidate_roots = event->candidate->roots_for(i),
         };
         validations.push_back(td::actor::ask(bus.manager, &ManagerFacade::validate_block_candidate, blocks[i].clone(),
                                              std::move(params), td::Timestamp::in(60.0)));
