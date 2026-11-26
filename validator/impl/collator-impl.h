@@ -243,7 +243,6 @@ class Collator final : public td::actor::Actor {
 
   std::map<td::Bits256, Ref<vm::Cell>> block_state_proofs_;
   std::vector<std::pair<BlockIdExt, vm::MerkleProofBuilder>> neighbor_proof_builders_;
-  std::vector<Ref<vm::Cell>> collated_roots_;
 
   struct AccountStorageDict {
     bool inited = false;
@@ -428,9 +427,10 @@ class Collator final : public td::actor::Actor {
 
   Ref<vm::Cell> collate_shard_block_descr_set();
   bool prepare_proofs();
-  bool create_collated_data();
-
-  bool create_block_candidate();
+  struct CollatedData;
+  td::Status prepare_collated_data(CollatedData& data);
+  td::actor::Task<> create_block_candidate();
+  td::Status publish_block_candidate(BlockCandidate candidate);
   void return_block_candidate();
   bool update_last_proc_int_msg(const std::pair<ton::LogicalTime, ton::Bits256>& new_lt_hash);
 

@@ -69,6 +69,15 @@ struct CandidateReceived {
   std::string contents_to_string() const;
 };
 
+// Apply the full group to its parent state for the next round.
+struct ApplyGroupCandidate {
+  using ReturnType = ChainStateRef;
+  using LogToDebug = std::true_type;
+
+  ChainStateRef parent;
+  CandidateRef candidate;
+};
+
 struct ValidationRequest {
   using ReturnType = ValidateCandidateResult;
 
@@ -203,11 +212,12 @@ class Db {
 
 class Bus : public td::actor::Bus {
  public:
-  using Events = td::TypeList<Start, StopRequested, FinalizeBlock, OurLeaderWindowStarted, OurLeaderWindowUpcoming,
-                              CandidateGenerated, CandidateReceived, ValidationRequest, IncomingProtocolMessage,
-                              OutgoingProtocolMessage, IncomingCandidateRequest, IncomingCollatorRequest,
-                              OutgoingOverlayRequest, BlockFinalizedInMasterchain, MisbehaviorReport, TraceEvent,
-                              NoncriticalParamsUpdated, ValidatorOptionsUpdated, PrecheckCandidateBroadcast>;
+  using Events =
+      td::TypeList<Start, StopRequested, FinalizeBlock, OurLeaderWindowStarted, OurLeaderWindowUpcoming,
+                   CandidateGenerated, CandidateReceived, ApplyGroupCandidate, ValidationRequest,
+                   IncomingProtocolMessage, OutgoingProtocolMessage, IncomingCandidateRequest, IncomingCollatorRequest,
+                   OutgoingOverlayRequest, BlockFinalizedInMasterchain, MisbehaviorReport, TraceEvent,
+                   NoncriticalParamsUpdated, ValidatorOptionsUpdated, PrecheckCandidateBroadcast>;
 
   Bus() = default;
   ~Bus() override {

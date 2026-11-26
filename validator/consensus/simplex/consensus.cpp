@@ -342,7 +342,7 @@ class ConsensusImpl : public td::actor::SpawnsWith<Bus>, public td::actor::Conne
     // The group uses authenticated parent queues to verify message order.
     auto state = std::move(parent.group_parent_state);
     if (parent.group_block.not_null()) {
-      state = state->apply_blocks(parent.group_block->blocks(), parent.group_block->member_roots);
+      state = co_await owning_bus().publish<ApplyGroupCandidate>(std::move(state), std::move(parent.group_block));
     }
     co_return ChainStateData{
         .prev_block_ids = std::move(parent.block_ids),

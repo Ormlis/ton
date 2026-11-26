@@ -74,6 +74,11 @@ class StateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
     co_return co_await resolve_state(request->id);
   }
 
+  template <>
+  td::actor::Task<ChainStateRef> process(BusHandle, std::shared_ptr<ApplyGroupCandidate> request) {
+    co_return co_await apply_group(request->parent, request->candidate);
+  }
+
  private:
   // ===== State resolution =====
   struct CachedState {
@@ -86,6 +91,24 @@ class StateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
   td::actor::SharedFuture<StartEvent> genesis_;
 
   std::map<ParentId, CachedState> state_cache_;
+
+  // The producer and both parent-resolution paths can ask for the same transition.
+  // Keep one leader window for reuse. Waiters own their future across eviction.
+  using GroupStateFuture = td::actor::SharedFuture<ChainStateRef>;
+  std::map<CandidateId, std::shared_ptr<GroupStateFuture>> group_states_;
+
+  td::actor::Task<ChainStateRef> apply_group(ChainStateRef parent, CandidateRef candidate) {
+    auto [it, inserted] = group_states_.try_emplace(candidate->id);
+    if (inserted) {
+      it->second =
+          std::make_shared<GroupStateFuture>(ChainState::apply_group(std::move(parent), std::move(candidate)).start());
+    }
+    auto future = it->second;
+    if (group_states_.size() > owning_bus()->config.slots_per_leader_window) {
+      group_states_.erase(group_states_.begin());
+    }
+    co_return co_await future->get();
+  }
 
   td::actor::Task<ResolvedState> resolve_state(ParentId id) {
     CachedState& entry = state_cache_[id];
@@ -135,10 +158,14 @@ class StateResolverImpl : public td::actor::SpawnsWith<Bus>, public td::actor::C
     }
 
     auto prev_data_state = co_await resolve_state(candidate->parent_id);
-    co_return ResolvedState{
-        .state = prev_data_state.state->apply_blocks(candidate->blocks(), candidate->member_roots),
-        .gen_utime_exact = gen_utime_exact,
-    };
+    if (!owning_bus()->group_members.empty()) {
+      auto state = co_await apply_group(prev_data_state.state, candidate);
+      co_return ResolvedState{std::move(state), gen_utime_exact};
+    }
+    auto roots = candidate->roots_for(0);
+    co_return ResolvedState{prev_data_state.state->apply(candidate->blocks().front(),
+                                                         roots.not_null() ? roots->block_root : Ref<vm::Cell>{}),
+                            gen_utime_exact};
   }
 
   // ===== Block finalization =====

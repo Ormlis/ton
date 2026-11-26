@@ -4,7 +4,7 @@
  */
 #include "block/mc-config.h"
 #include "block/signature-set.h"
-#include "consensus/types.h"
+#include "consensus/bus.h"
 #include "keys/encryptor.h"
 #include "td/actor/BackpressureQueue.h"
 #include "td/actor/TestScheduler.h"
@@ -12,6 +12,7 @@
 #include "tl-utils/tl-utils.hpp"
 #include "ton/ton-shard.h"
 #include "validator/impl/shard-group.h"
+#include "vm/boc-compression.h"
 
 namespace ton::validator::consensus {
 namespace {
@@ -199,6 +200,74 @@ TEST(ShardGroups, GroupProofs) {
   other = round;
   other.collated_file_hashes.back() = hash_for(7);
   ASSERT_TRUE(!verify(other));
+}
+
+TEST(ShardGroups, ReceivedGroupKeepsItsWireEncoding) {
+  struct Schedule : CollatorSchedule {
+    PeerValidatorId expected_collator_for(td::uint32) const override {
+      return PeerValidatorId{0};
+    }
+  };
+  Bus bus;
+  bus.collator_schedule = td::make_ref<Schedule>();
+  bus.config.slots_per_leader_window = 4;
+  bus.session_id = hash_for(1);
+  bus.group_members = block::CatchainValidatorsConfig::group_members_at({basechainId, 1ULL << 62}, 1);
+  PrivateKey key{privkeys::Ed25519::random()};
+  auto pub = key.compute_public_key();
+  PeerValidatorId leader{0};
+  bus.validator_set.push_back(PeerValidator{leader, pub, pub.compute_short_id(), {}, 1});
+
+  std::vector<td::BufferSlice> frames;
+  for (size_t i = 0; i < bus.group_members.size(); ++i) {
+    auto root = vm::CellBuilder().store_long(i, 8).finalize();
+    frames.push_back(create_serialize_tl_object<ton_api::validatorSession_compressedCandidateV2>(
+        0, td::Bits256::zero(), 1, root->get_hash().as_bits256(), vm::boc_compress({root}).move_as_ok()));
+  }
+  auto decode = [&] {
+    std::vector<Candidate::DecodedMember> members;
+    for (size_t i = 0; i < frames.size(); ++i) {
+      members.push_back(
+          Candidate::decode_member(frames[i].clone(), bus.group_members[i], pub, 1024, 1024).move_as_ok());
+    }
+    return members;
+  };
+  CandidateHashData data{{}, {}, std::nullopt};
+  for (auto& member : decode()) {
+    data.blocks.push_back(member.block.id);
+    data.collated_file_hashes.push_back(member.block.collated_file_hash);
+  }
+  auto id = data.build_id_with(7);
+  auto sign = [&](const PrivateKey& signer, td::BufferSlice bytes) {
+    auto message = create_serialize_tl_object<tl::dataToSign>(bus.session_id, std::move(bytes));
+    return signer.create_decryptor().move_as_ok()->sign(message).move_as_ok();
+  };
+  PrivateKey collator{privkeys::Ed25519::random()};
+  auto collator_key = collator.compute_public_key();
+  Delegation delegation{collator_key, sign(key, create_serialize_tl_object<tl::delegationToSign>(
+                                                    4, collator_key.compute_short_id().bits256_value()))};
+  auto signature = sign(collator, serialize_tl_object(id.to_tl(), true));
+  auto assemble = [&](std::vector<Candidate::DecodedMember> members, CandidateId advertised) {
+    return Candidate::from_group_parts(advertised, {}, std::move(members), signature.clone(), delegation.clone(), bus);
+  };
+  auto members = decode();
+  std::swap(members.front(), members.back());
+  ASSERT_TRUE(assemble(std::move(members), id).is_error());
+  ASSERT_TRUE(assemble(decode(), {id.slot, hash_for(9)}).is_error());
+  auto received = assemble(decode(), id).move_as_ok();
+  auto bad_signature = signature.copy();
+  bad_signature.data()[0] ^= 1;
+  ASSERT_TRUE(
+      Candidate::from_group_parts(id, {}, decode(), std::move(bad_signature), delegation.clone(), bus).is_error());
+  auto restored = Candidate::deserialize(received->serialize(), bus, id.slot).move_as_ok();
+  ASSERT_TRUE(restored->id == id &&
+              restored->collated_by(bus) == adnl::AdnlNodeIdShort{collator_key.compute_short_id()});
+  auto broadcast_frames = received->encoded_blocks();
+  auto stored_frames = restored->encoded_blocks();
+  for (size_t i = 0; i < frames.size(); ++i) {
+    ASSERT_TRUE(broadcast_frames[i].as_slice() == frames[i].as_slice());
+    ASSERT_TRUE(stored_frames[i].as_slice() == frames[i].as_slice());
+  }
 }
 
 }  // namespace

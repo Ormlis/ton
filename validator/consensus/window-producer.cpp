@@ -214,7 +214,9 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
         finished_at_monotonic = std::max(finished_at_monotonic, member.collated_at_monotonic);
         blocks.push_back(std::move(member.candidate));
       }
-      state = state->apply_blocks(blocks);
+      if (bus.group_members.empty()) {
+        state = state->apply(blocks.front());
+      }
       block = std::move(blocks);
       id = CandidateHashData::from(block, parent).build_id_with(slot);
       if (!std::isfinite(finished_at_monotonic) || finished_at_monotonic <= 0.0) {
@@ -256,6 +258,9 @@ td::actor::Task<> produce_window(BusHandle bus_handle, ProduceWindowContext ctx)
     bus_handle.publish<CandidateReceived>(candidate);
     bus_handle.publish<TraceEvent>(stats::CandidateReceived::create(candidate, true));
     parent = id;
+    if (generated_candidate && !bus.group_members.empty() && slot + 1 < ctx.end_slot && !ctx.is_superseded()) {
+      state = co_await bus_handle.publish<ApplyGroupCandidate>(std::move(state), candidate);
+    }
 
     slot_start += ctx.target_rate;
   }

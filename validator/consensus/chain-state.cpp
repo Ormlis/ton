@@ -80,22 +80,21 @@ ChainState::ChainState(std::vector<td::Ref<ChainState>> members)
     : members_(std::move(members)), tip_(members_.front()->tip_) {
 }
 
-td::Ref<ChainState> ChainState::apply_blocks(const std::vector<BlockCandidate>& blocks,
-                                             const std::vector<CandidateRootsRef>& roots) const {
-  CHECK(roots.empty() || roots.size() == blocks.size());
-  auto apply_member = [&](size_t i) {
-    return member(i).apply(blocks[i], roots.empty() ? Ref<vm::Cell>{} : roots[i]->block_root);
+td::actor::Task<ChainStateRef> ChainState::apply_group(ChainStateRef parent, CandidateRef candidate) {
+  const auto& blocks = candidate->blocks();
+  CHECK(!parent->members_.empty() && blocks.size() == parent->members_.size());
+  auto apply_member = [](ChainStateRef previous, CandidateRef group, size_t i) -> td::actor::Task<ChainStateRef> {
+    auto roots = group->roots_for(i);
+    co_return previous->apply(group->blocks()[i], roots.not_null() ? roots->block_root : Ref<vm::Cell>{});
   };
-  if (members_.empty()) {
-    CHECK(blocks.size() == 1);
-    return apply_member(0);
-  }
-  CHECK(blocks.size() == members_.size());
-  std::vector<td::Ref<ChainState>> next;
+  std::vector<td::actor::StartedTask<ChainStateRef>> tasks;
+  tasks.reserve(blocks.size());
   for (size_t i = 0; i < blocks.size(); ++i) {
-    next.push_back(apply_member(i));
+    auto task = apply_member(parent->members_[i], candidate, i);
+    task.set_executor(td::actor::Executor::on_scheduler());
+    tasks.push_back(std::move(task).start());
   }
-  return td::make_ref<ChainState>(std::move(next));
+  co_return td::make_ref<ChainState>(co_await td::actor::all(std::move(tasks)));
 }
 
 std::vector<BlockIdExt> ChainState::block_ids() const {

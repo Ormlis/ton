@@ -3,6 +3,7 @@ set(TON_VALIDATOR_SOURCE
   block.cpp
   check-proof.cpp
   collator.cpp
+  collator-finalize.cpp
   config.cpp
   external-message.cpp
   ext-message-checker.cpp

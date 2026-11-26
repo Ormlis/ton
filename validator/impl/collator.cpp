@@ -2659,21 +2659,7 @@ td::actor::Task<> Collator::do_collate_inner() {
       co_return td::Status::Error("cannot create new Block");
     }
   }
-  {
-    // E. create collated data
-    td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.create_collated_data};
-    if (!create_collated_data()) {
-      co_return td::Status::Error("cannot create collated data for new Block candidate");
-    }
-  }
-  {
-    // F. create a block candidate
-    LOG(DEBUG) << "create a Block candidate";
-    td::ScopedRealCpuTimer::Guard timer{work_timer_, &stats_.work_time.create_block_candidate};
-    if (!create_block_candidate()) {
-      co_return td::Status::Error("cannot serialize a new Block candidate");
-    }
-  }
+  co_await create_block_candidate();
   post_ext_token.finish(td::Result<td::Unit>(td::Unit()));
   co_return {};
 }
@@ -6710,245 +6696,29 @@ bool Collator::prepare_proofs() {
   return res;
 }
 
-/**
- * Creates collated data for the block.
- *
- * @returns True if the collated data was successfully created, false otherwise.
- */
-bool Collator::create_collated_data() {
-  // 1.1 store the set of used shard block descriptions
-  if (!used_shard_block_descr_.empty()) {
-    auto cell = collate_shard_block_descr_set();
-    if (cell.not_null()) {
-      collated_roots_.push_back(std::move(cell));
-    }
-  }
-  // 1.2 store ConsensusExtraData
-  {
-    // consensus_extra_data#638eb292 flags:# gen_utime_ms:uint64 = ConsensusExtraData;
-    auto cell = vm::CellBuilder{}.store_long(0x638eb292, 32).store_long(0, 32).store_long(now_ms_, 64).finalize_novm();
-    collated_roots_.push_back(std::move(cell));
-  }
-  if (!full_collated_data_) {
-    return true;
-  }
-  // 2. Proofs for hashes of states: previous states + neighbors
-  for (const auto& p : block_state_proofs_) {
-    collated_roots_.push_back(p.second);
-  }
-  bool new_collated_data_format = global_version_ >= 16;
-  std::vector<Ref<vm::Cell>> new_proof_roots;
-  // 3. Previous state proof (only shardchains)
-  std::map<td::Bits256, Ref<vm::Cell>> old_proofs;
-  if (!is_masterchain()) {
-    if (!prepare_proofs()) {
-      return fatal_error("cannot prepare proof for collated data");
-    }
-
-    if (new_collated_data_format) {
-      for (auto prev_state : prev_states) {
-        new_proof_roots.push_back(prev_state->root_cell());
-        Ref<vm::Cell> cell;
-        FAIL_UNLESS(
-            block::gen::t_CollatedDataRootState.cell_pack_collated_data_root_state(cell, prev_state->root_hash()));
-        collated_roots_.push_back(std::move(cell));
-      }
-    } else {
-      state_usage_tree_->set_ignore_loads(true);
-      auto r_state_proof = vm::MerkleProof::generate(
-          prev_state_root_, [&](const Ref<vm::Cell>& c) { return !collated_data_stat.is_loaded(c->get_hash()); });
-      if (r_state_proof.is_error()) {
-        return fatal_error("cannot generate Merkle proof for previous state");
-      }
-      auto state_proof = r_state_proof.move_as_ok();
-      if (after_merge_) {
-        bool special;
-        auto cs = vm::load_cell_slice_special(state_proof, special);
-        FAIL_UNLESS(cs.special_type() == vm::CellTraits::SpecialType::MerkleProof);
-        cs = vm::load_cell_slice(cs.prefetch_ref(0));
-        FAIL_UNLESS(cs.size_refs() == 2);
-        FAIL_UNLESS(cs.size() == 32);
-        FAIL_UNLESS(cs.prefetch_ulong(32) == 0x5f327da5U);
-        old_proofs[cs.prefetch_ref(0)->get_hash(0).bits()] = vm::CellBuilder::create_merkle_proof(cs.prefetch_ref(0));
-        old_proofs[cs.prefetch_ref(1)->get_hash(0).bits()] = vm::CellBuilder::create_merkle_proof(cs.prefetch_ref(1));
-      } else {
-        old_proofs[prev_state_root_->get_hash().bits()] = std::move(state_proof);
-      }
-    }
-  }
-  // 4. Proofs for message queues
-  for (auto& [block_id, mpb] : neighbor_proof_builders_) {
-    if (prev_block_idx(block_id) != -1) {
-      // This was already generated in "3. Previous state proof"
-      continue;
-    }
-    if (new_collated_data_format) {
-      new_proof_roots.push_back(mpb.original_root());
-      Ref<vm::Cell> cell;
-      FAIL_UNLESS(block::gen::t_CollatedDataRootState.cell_pack_collated_data_root_state(
-          cell, mpb.root()->get_hash().as_bits256()));
-      collated_roots_.push_back(std::move(cell));
-    } else {
-      auto r_proof = vm::MerkleProof::generate(
-          mpb.original_root(), [&](const Ref<vm::Cell>& c) { return !collated_data_stat.is_loaded(c->get_hash()); });
-      if (r_proof.is_error()) {
-        return fatal_error("cannot generate Merkle proof for neighbor");
-      }
-      auto proof = r_proof.move_as_ok();
-      auto it = old_proofs.emplace(mpb.root()->get_hash().bits(), proof);
-      if (!it.second) {
-        auto r_combine = vm::MerkleProof::combine(it.first->second, std::move(proof));
-        if (r_combine.is_error()) {
-          return fatal_error("cannot combine merkle proofs");
-        }
-        it.first->second = r_combine.move_as_ok();
-      }
-    }
-  }
-
-  for (auto& p : old_proofs) {
-    collated_roots_.push_back(std::move(p.second));
-  }
-
-  // 5. Proofs for account storage dicts
-  for (auto& [_, dict] : account_storage_dicts_) {
-    if (!dict.add_to_collated_data) {
-      continue;
-    }
-    if (new_collated_data_format) {
-      new_proof_roots.push_back(dict.mpb.original_root());
-      Ref<vm::Cell> cell;
-      FAIL_UNLESS(block::gen::t_CollatedDataRootStorageDict.cell_pack_collated_data_root_storage_dict(
-          cell, new_proof_roots.back()->get_hash().as_bits256()));
-      collated_roots_.push_back(std::move(cell));
-    } else {
-      auto r_proof = vm::MerkleProof::generate(dict.mpb.original_root(), [&](const Ref<vm::Cell>& c) {
-        return !collated_data_stat.is_loaded(c->get_hash());
-      });
-      if (r_proof.is_error()) {
-        return fatal_error("cannot generate Merkle proof for neighbor");
-      }
-      auto proof = r_proof.move_as_ok();
-      // account_storage_dict_proof#37c1e3fc proof:^Cell = AccountStorageDictProof;
-      collated_roots_.push_back(vm::CellBuilder()
-                                    .store_long(block::gen::AccountStorageDictProof::cons_tag[0], 32)
-                                    .store_ref(proof)
-                                    .finalize_novm());
-    }
-  }
-
-  if (new_collated_data_format) {
-    Ref<vm::Cell> separator;
-    FAIL_UNLESS(block::gen::t_CollatedDataSeparator.cell_pack_collated_data_separator(separator));
-    collated_roots_.push_back(std::move(separator));
-    state_usage_tree_->set_ignore_loads(true);
-    td::HashMap<vm::CellHash, Ref<vm::Cell>> cache;
-    std::function<Ref<vm::Cell>(const Ref<vm::Cell>&)> dfs = [&](const Ref<vm::Cell>& cell) -> Ref<vm::Cell> {
-      auto it = cache.find(cell->get_hash());
-      if (it != cache.end()) {
-        return it->second;
-      }
-      if (!collated_data_stat.is_loaded(cell->get_hash())) {
-        return cache[cell->get_hash()] = vm::CellBuilder::create_pruned_branch(cell, vm::Cell::max_level);
-      }
-      vm::CellSlice cs(vm::NoVm(), cell);
-      vm::CellBuilder cb;
-      cb.store_bits(cs.fetch_bits(cs.size()));
-      for (unsigned i = 0; i < cs.size_refs(); i++) {
-        cb.store_ref(dfs(cs.prefetch_ref(i)));
-      }
-      auto hash_hint = [&](unsigned level, const vm::Cell::LevelMask&, vm::CellHash& hash) {
-        if (level <= cell->get_level()) {
-          hash = cell->get_hash(level);
-          return true;
-        }
-        return false;
-      };
-      return cache[cell->get_hash()] = cb.finalize(cs.is_special(), std::move(hash_hint));
-    };
-    for (const auto& root : new_proof_roots) {
-      collated_roots_.push_back(dfs(root));
-    }
-  }
-  return true;
-}
-
-/**
- * Creates a block candidate for the Collator.
- *
- * This function serializes the new block and collated data, and creates a BlockCandidate object
- * with the necessary information. It then checks if the size of the block candidate exceeds the
- * limits specified in the consensus configuration.
- *
- * Finally, the block candidate is saved to the disk.
- * If there are any bad external messages or delayed external messages, the ValidatorManager is called to handle them.
- *
- * @returns True if the block candidate was created successfully, false otherwise.
- */
-bool Collator::create_block_candidate() {
+td::Status Collator::publish_block_candidate(BlockCandidate candidate) {
   auto consensus_config = config_->get_new_consensus_config(workchain());
-  // 1. serialize block
-  LOG(INFO) << "serializing new Block";
-  vm::BagOfCells boc;
-  boc.set_root(new_block);
-  auto res = boc.import_cells();
-  if (res.is_error()) {
-    return fatal_error(res.move_as_error());
-  }
-  auto blk_res = boc.serialize_to_slice(31);
-  if (blk_res.is_error()) {
-    LOG(ERROR) << "cannot serialize block";
-    return fatal_error(blk_res.move_as_error());
-  }
-  auto blk_slice = blk_res.move_as_ok();
-  // 2. serialize collated data
-  td::BufferSlice cdata_slice;
-  if (collated_roots_.empty()) {
-    cdata_slice = td::BufferSlice{0};
-  } else {
-    vm::BagOfCells boc_collated;
-    boc_collated.set_roots(collated_roots_);
-    res = boc_collated.import_cells();
-    if (res.is_error()) {
-      return fatal_error(res.move_as_error());
-    }
-    auto cdata_res = boc_collated.serialize_to_slice(2);
-    if (cdata_res.is_error()) {
-      LOG(ERROR) << "cannot serialize collated data";
-      return fatal_error(cdata_res.move_as_error());
-    }
-    cdata_slice = cdata_res.move_as_ok();
-  }
-  LOG(INFO) << "serialized block size " << blk_slice.size() << " bytes (preliminary estimate was "
+  block_candidate = std::make_unique<BlockCandidate>(std::move(candidate));
+  LOG(INFO) << "serialized block size " << block_candidate->data.size() << " bytes (preliminary estimate was "
             << block_size_estimate_ << ")";
   auto st = block_limit_status_->st_stat.get_total_stat();
-  LOG(INFO) << "size regression stats: " << blk_slice.size() << " " << st.cells << " " << st.bits << " "
+  LOG(INFO) << "size regression stats: " << block_candidate->data.size() << " " << st.cells << " " << st.bits << " "
             << st.internal_refs << " " << st.external_refs << " " << block_limit_status_->accounts << " "
             << block_limit_status_->transactions;
-  LOG(INFO) << "serialized collated data size " << cdata_slice.size() << " bytes (preliminary estimate was "
-            << block_limit_status_->collated_data_size_estimate << ")";
-  auto new_block_id_ext = ton::BlockIdExt{ton::BlockId{shard_, new_block_seqno}, new_block->get_hash().bits(),
-                                          block::compute_file_hash(blk_slice.as_slice())};
-  // 3. create a BlockCandidate
-  block_candidate = std::make_unique<BlockCandidate>(params_.creator, new_block_id_ext,
-                                                     block::compute_file_hash(cdata_slice.as_slice()),
-                                                     blk_slice.clone(), cdata_slice.clone());
-
-  // 3.1 check block and collated data size
+  LOG(INFO) << "serialized collated data size " << block_candidate->collated_data.size()
+            << " bytes (preliminary estimate was " << block_limit_status_->collated_data_size_estimate << ")";
   if (block_candidate->data.size() > consensus_config.max_block_size) {
-    return fatal_error(PSTRING() << "block size (" << block_candidate->data.size()
-                                 << ") exceeds the limit in consensus config (" << consensus_config.max_block_size
-                                 << ")");
+    return td::Status::Error(PSTRING() << "block size (" << block_candidate->data.size()
+                                       << ") exceeds the limit in consensus config (" << consensus_config.max_block_size
+                                       << ")");
   }
   if (block_candidate->collated_data.size() > consensus_config.max_collated_data_size &&
       !params_.collator_opts->ignore_collated_data_limits) {
-    return fatal_error(PSTRING() << "collated data size (" << block_candidate->collated_data.size()
-                                 << ") exceeds the limit in consensus config ("
-                                 << consensus_config.max_collated_data_size << ")");
+    return td::Status::Error(PSTRING() << "collated data size (" << block_candidate->collated_data.size()
+                                       << ") exceeds the limit in consensus config ("
+                                       << consensus_config.max_collated_data_size << ")");
   }
-  // 4. finish collation
   td::actor::send_closure_later(actor_id(this), &Collator::return_block_candidate);
-  // 5. communicate about bad and delayed external messages
   if (!bad_ext_msgs_.empty()) {
     LOG(INFO) << "sending complete_external_messages() to Manager";
     td::actor::send_closure_later(manager, &ValidatorManager::complete_external_messages, std::move(bad_ext_msgs_));
@@ -6957,7 +6727,7 @@ bool Collator::create_block_candidate() {
     td::actor::send_closure(manager, &ValidatorManager::update_storage_stat_cache,
                             std::move(storage_stat_cache_update_));
   }
-  return true;
+  return td::Status::OK();
 }
 
 /**

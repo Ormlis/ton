@@ -155,14 +155,22 @@ struct Delegation {
 
 struct Candidate : td::CntObject {
   using Signer = std::variant<PeerValidatorId, Delegation>;
+  struct DecodedMember {
+    BlockCandidate block;
+    CandidateRootsRef roots;
+    td::BufferSlice encoded;
+  };
 
   static td::Result<td::Ref<Candidate>> deserialize(td::Slice data, const Bus& bus,
                                                     std::optional<td::uint32> expected_slot = std::nullopt);
   static td::Result<td::Ref<Candidate>> deserialize_from_broadcast(td::Slice data, Signer signer, const Bus& bus,
                                                                    td::uint32 expected_slot);
 
-  static td::Result<td::Ref<Candidate>> deserialize_broadcast_data(tl::CandidateDataRef data, Signer signer,
-                                                                   const Bus& bus, td::uint32 expected_slot);
+  static td::Result<DecodedMember> decode_member(td::BufferSlice encoded, ShardIdFull shard, const PublicKey& leader,
+                                                 td::uint32 max_block_size, td::uint32 max_collated_data_size);
+  static td::Result<td::Ref<Candidate>> from_group_parts(CandidateId id, ParentId parent,
+                                                         std::vector<DecodedMember> members, td::BufferSlice signature,
+                                                         Signer signer, const Bus& bus);
   std::vector<td::BufferSlice> encoded_blocks() const;
   static td::Result<td::BufferSlice> encode_block(const BlockCandidate& block, CandidateRootsRef roots = {});
 
@@ -196,10 +204,8 @@ struct Candidate : td::CntObject {
   adnl::AdnlNodeIdShort collated_by(const Bus& bus) const;
 
  private:
-  static td::Result<td::Ref<Candidate>> deserialize_data(tl::CandidateDataRef data,
-                                                         std::optional<Delegation> delegation, const Bus& bus,
-                                                         std::optional<PeerValidatorId> src,
-                                                         std::optional<td::uint32> expected_slot);
+  static td::Result<td::Ref<Candidate>> deserialize_data(tl::CandidateDataRef data, std::optional<Signer> signer,
+                                                         const Bus& bus, std::optional<td::uint32> expected_slot);
 
   tl::CandidateDataRef to_data_tl() const;
   std::vector<td::BufferSlice> encoded_members_;

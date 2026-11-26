@@ -10,6 +10,7 @@
 #include "validator/interfaces/block.h"
 
 #include "manager-facade.h"
+#include "types.h"
 
 namespace ton::validator::consensus {
 
@@ -125,8 +126,7 @@ class ChainState : public td::CntObject {
   const ChainState& member(size_t i) const {
     return members_.empty() ? *this : *members_.at(i);
   }
-  td::Ref<ChainState> apply_blocks(const std::vector<BlockCandidate>& blocks,
-                                   const std::vector<CandidateRootsRef>& roots = {}) const;
+  static td::actor::Task<td::Ref<ChainState>> apply_group(td::Ref<ChainState> parent, CandidateRef candidate);
 
   std::vector<BlockIdExt> block_ids() const;
   std::vector<td::Ref<BlockData>> block_data() const;

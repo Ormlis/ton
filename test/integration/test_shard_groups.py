@@ -34,18 +34,22 @@ async def block_for_lt(client, shard, lt):
             await asyncio.sleep(0.2)
 
 
-@pytest.mark.parametrize("grouped", [True, False])
+@pytest.mark.parametrize(
+    ("grouped", "global_version", "port_base"),
+    [(True, 17, 19632), (True, 15, 19664), (False, 17, 19600)],
+    ids=["True", "legacy-proofs", "False"],
+)
 @pytest.mark.asyncio
-async def test_cross_shard_delivery(tmp_path, grouped):
+async def test_cross_shard_delivery(tmp_path, grouped, global_version, port_base):
     repo = Path(__file__).resolve().parents[2]
     install = Install(repo / "build", repo)
     install.tonlibjson.client_set_verbosity_level(1)
     async with (
         asyncio.timeout(150),
-        Network(install, tmp_path, port_base=19600 + 32 * grouped) as net,
+        Network(install, tmp_path, port_base=port_base) as net,
     ):
         net.config.split = 1
-        net.config.global_version = 17  # Masterchain validators recompute the total supply.
+        net.config.global_version = global_version  # v15 uses legacy proofs, v17 also checks total supply.
         net.config.shard_group_levels = int(grouped)
         net.config.shard_validators = 2
         dht = net.create_dht_node()

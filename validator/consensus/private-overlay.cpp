@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: LGPL-2.0-or-later
  */
 
+#include <algorithm>
 #include <map>
 #include <random>
 #include <vector>
@@ -88,6 +89,9 @@ class PrivateOverlayImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
 
   template <>
   void handle(BusHandle, std::shared_ptr<const StopRequested>) {
+    for (auto& waiter : capacity_waiters_) {
+      waiter.set_error(td::Status::Error(ErrorCode::cancelled, "Overlay stopped"));
+    }
     td::actor::send_closure(overlays_, &overlay::Overlays::delete_overlay, local_adnl_id_, overlay_id_);
     stop();
   }
@@ -178,6 +182,31 @@ class PrivateOverlayImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
   }
 
  private:
+  struct MemberPart {
+    bool received = false;
+    td::BufferSlice pending;
+    std::optional<Candidate::DecodedMember> decoded;
+  };
+  struct PartialGroup {
+    td::uint64 generation;
+    PublicKeyHash source;
+    td::Bits256 hash;
+    ParentId parent;
+    td::BufferSlice signature;
+    Candidate::Signer signer;
+    std::vector<MemberPart> parts;
+    size_t bytes = 1024;
+    size_t decoded = 0;
+  };
+  struct ParsedExtra {
+    td::uint32 slot = 0;
+    std::optional<Delegation> delegation;
+    int member = -1;
+    std::optional<td::Bits256> group_hash;
+    ParentId parent;
+    td::BufferSlice signature;
+  };
+
   std::unique_ptr<overlay::Overlays::Callback> make_callback() {
     class Callback final : public overlay::Overlays::Callback {
      public:
@@ -246,47 +275,145 @@ class PrivateOverlayImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
       }
       signer = it->second.idx;
     }
-    td::Result<CandidateRef> maybe_candidate;
-    if (parsed_extra.group_hash) {
-      // Precheck authenticates the slot leader and bounds the index. Never retain an unbounded number of partial slots.
-      auto it = partial_.find(parsed_extra.slot);
-      if (it == partial_.end()) {
-        if (partial_.size() == max_partial_slots) {
-          partial_.erase(partial_.begin());
-        }
-        it = partial_
-                 .emplace(parsed_extra.slot, PartialGroup{src, *parsed_extra.group_hash,
-                                                          std::vector<td::BufferSlice>(bus.group_members.size())})
-                 .first;
-      }
-      auto& group = it->second;
-      if (group.source != src || group.hash != *parsed_extra.group_hash || data.empty() ||
-          !group.parts[parsed_extra.member].empty()) {
-        return;
-      }
-      group.bytes += data.size() + 8;
-      if (group.bytes > Bus::max_group_candidate_bytes) {
-        partial_.erase(it);
-        return;
-      }
-      group.parts[parsed_extra.member] = std::move(data);
-      if (++group.received != group.parts.size()) {
-        return;
-      }
-      auto assembled = create_tl_object<ton_api::consensus_blockGroup>(
-          parsed_extra.slot, CandidateId::parent_id_to_tl(parsed_extra.parent), std::move(group.parts),
-          std::move(parsed_extra.signature));
-      partial_.erase(it);
-      maybe_candidate =
-          Candidate::deserialize_broadcast_data(std::move(assembled), std::move(signer), bus, parsed_extra.slot);
-      if (maybe_candidate.is_ok() && maybe_candidate.ok()->id.hash != *parsed_extra.group_hash) {
-        return;
-      }
-    } else {
-      maybe_candidate =
-          Candidate::deserialize_from_broadcast(std::move(data), std::move(signer), bus, parsed_extra.slot);
+    if (!parsed_extra.group_hash) {
+      received_candidate(Candidate::deserialize_from_broadcast(data, std::move(signer), bus, parsed_extra.slot));
+      return;
     }
 
+    receive_group_part(src, std::move(data), std::move(parsed_extra), std::move(signer))
+        .start_immediate()
+        .detach_silent();
+  }
+
+  auto evictable_group() {
+    auto done =
+        std::find_if(partial_.begin(), partial_.end(), [](const auto& entry) { return entry.second.parts.empty(); });
+    if (done != partial_.end()) {
+      return done;
+    }
+    return std::find_if(partial_.begin(), partial_.end(), [](const auto& entry) {
+      const auto& parts = entry.second.parts;
+      return std::any_of(parts.begin(), parts.end(), [](const auto& part) { return !part.received; });
+    });
+  }
+
+  td::actor::Task<> wait_for_group_capacity(td::uint32 slot) {
+    // All resident groups have their last part. A decoder will free a slot without further network input.
+    while (!partial_.contains(slot) && partial_.size() == max_partial_slots && evictable_group() == partial_.end()) {
+      auto [ready, promise] = td::actor::StartedTask<>::make_bridge();
+      capacity_waiters_.push_back(std::move(promise));
+      co_await std::move(ready);
+    }
+    co_return {};
+  }
+
+  td::actor::Task<> receive_group_part(PublicKeyHash src, td::BufferSlice data, ParsedExtra parsed_extra,
+                                       Candidate::Signer signer) {
+    if (data.empty() || data.size() > Bus::max_group_candidate_bytes) {
+      co_return {};
+    }
+    auto it = partial_.find(parsed_extra.slot);
+    while (it == partial_.end() && partial_.size() == max_partial_slots) {
+      auto victim = evictable_group();
+      if (victim != partial_.end()) {
+        partial_.erase(victim);
+        break;
+      }
+      co_await wait_for_group_capacity(parsed_extra.slot);
+      it = partial_.find(parsed_extra.slot);
+    }
+    if (it == partial_.end()) {
+      it = partial_
+               .emplace(parsed_extra.slot,
+                        PartialGroup{++generation_, src, *parsed_extra.group_hash, parsed_extra.parent,
+                                     std::move(parsed_extra.signature), std::move(signer),
+                                     std::vector<MemberPart>(owning_bus()->group_members.size())})
+               .first;
+    } else if (it->second.source != src || it->second.hash != *parsed_extra.group_hash ||
+               it->second.parent != parsed_extra.parent ||
+               it->second.signature.as_slice() != parsed_extra.signature.as_slice()) {
+      co_return {};
+    }
+    auto& group = it->second;
+    if (group.parts.empty() || group.parts[parsed_extra.member].received) {
+      co_return {};
+    }
+    group.bytes += data.size() + 8;
+    if (group.bytes > Bus::max_group_candidate_bytes) {
+      partial_.erase(it);
+      co_return {};
+    }
+    auto& part = group.parts[parsed_extra.member];
+    part.received = true;
+    part.pending = std::move(data);
+    start_decodes();
+    co_return {};
+  }
+
+  static td::actor::Task<> decode_part(td::actor::ActorId<PrivateOverlayImpl> owner, td::uint32 slot,
+                                       td::uint64 generation, size_t index, td::BufferSlice data, ShardIdFull shard,
+                                       PublicKey leader, td::uint32 max_block_size, td::uint32 max_collated_data_size) {
+    co_await td::actor::detach_from_actor();
+    auto member = Candidate::decode_member(std::move(data), shard, leader, max_block_size, max_collated_data_size);
+    td::actor::send_closure(owner, &PrivateOverlayImpl::decoded_part, slot, generation, index, std::move(member));
+    co_return {};
+  }
+
+  void start_decodes() {
+    const auto& bus = *owning_bus();
+    for (auto& [slot, group] : partial_) {
+      for (size_t i = 0; i < group.parts.size(); ++i) {
+        // Also bounds workers whose partial slot has since been evicted.
+        if (decoding_ == bus.group_members.size()) {
+          return;
+        }
+        auto& pending = group.parts[i].pending;
+        if (!pending.empty()) {
+          ++decoding_;
+          auto& leader = bus.collator_schedule->expected_collator_for(slot).get_using(bus);
+          decode_part(actor_id(this), slot, group.generation, i, std::move(pending), bus.group_members[i], leader.key,
+                      bus.config.max_block_size, bus.config.max_collated_data_size)
+              .start_immediate()
+              .detach();
+        }
+      }
+    }
+  }
+
+  void decoded_part(td::uint32 slot, td::uint64 generation, size_t index, td::Result<Candidate::DecodedMember> result) {
+    --decoding_;
+    auto it = partial_.find(slot);
+    if (it != partial_.end() && it->second.generation == generation) {
+      auto& group = it->second;
+      if (result.is_error()) {
+        LOG(WARNING) << "Invalid shard group candidate part: " << result.move_as_error();
+        partial_.erase(it);
+      } else {
+        group.parts[index].decoded = result.move_as_ok();
+        if (++group.decoded == group.parts.size()) {
+          std::vector<Candidate::DecodedMember> members;
+          members.reserve(group.parts.size());
+          for (auto& part : group.parts) {
+            members.push_back(std::move(*part.decoded));
+          }
+          group.parts.clear();  // Ignore repeat deliveries until this slot ages out.
+          received_candidate(Candidate::from_group_parts({slot, group.hash}, group.parent, std::move(members),
+                                                         group.signature.clone(), std::move(group.signer),
+                                                         *owning_bus()));
+        }
+      }
+    }
+    if (!capacity_waiters_.empty() && (partial_.size() < max_partial_slots || evictable_group() != partial_.end())) {
+      auto waiters = std::move(capacity_waiters_);
+      for (auto& promise : waiters) {
+        promise.set_value({});
+      }
+    }
+    start_decodes();
+  }
+
+  void received_candidate(td::Result<CandidateRef> maybe_candidate) {
+    auto& bus = *owning_bus();
     if (maybe_candidate.is_error()) {
       // FIXME: If we actually collected signed broadcast parts, we could have produced a
       //        MisbehaviorProof here.
@@ -328,10 +455,14 @@ class PrivateOverlayImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
       }
     }
 
-    co_return co_await owning_bus()
+    co_await owning_bus()
         .publish<PrecheckCandidateBroadcast>(parsed_extra.slot, broadcast_id, signature_checked, parsed_extra.member,
                                              parsed_extra.group_hash)
         .trace("Precheck failed");
+    if (parsed_extra.group_hash && signature_checked) {
+      co_await wait_for_group_capacity(parsed_extra.slot);
+    }
+    co_return {};
   }
 
   td::actor::Task<td::BufferSlice> on_query(adnl::AdnlNodeIdShort src, td::BufferSlice data) {
@@ -374,24 +505,11 @@ class PrivateOverlayImpl : public td::actor::SpawnsWith<Bus>, public td::actor::
   std::vector<adnl::AdnlNodeIdShort> overlay_nodes_;
   std::vector<adnl::AdnlNodeIdShort> other_overlay_nodes_;
 
-  struct PartialGroup {
-    PublicKeyHash source;
-    td::Bits256 hash;
-    std::vector<td::BufferSlice> parts;
-    size_t bytes = 1024;
-    size_t received = 0;
-  };
   static constexpr size_t max_partial_slots = 4;
   std::map<td::uint32, PartialGroup> partial_;
-
-  struct ParsedExtra {
-    td::uint32 slot = 0;
-    std::optional<Delegation> delegation;
-    int member = -1;
-    std::optional<td::Bits256> group_hash;
-    ParentId parent;
-    td::BufferSlice signature;
-  };
+  std::vector<td::Promise<td::Unit>> capacity_waiters_;
+  td::uint64 generation_ = 0;
+  size_t decoding_ = 0;
 
   td::Result<ParsedExtra> parse_broadcast_extra(td::Slice extra) {
     TRY_RESULT(parsed, fetch_tl_object<tl::BroadcastExtra>(extra, true));
