@@ -88,6 +88,7 @@ struct BroadcastTwostep : td::ListNode {
   Overlay::BroadcastHash broadcast_id;
   td::uint32 date;
   std::unique_ptr<td::raptorq::Decoder> decoder;
+  bool solver_running = false;
   bool delivered = false;
   bool rebroadcasted_part = false;
   std::set<td::uint32> seen_parts = {};
@@ -372,6 +373,12 @@ td::actor::Task<> BroadcastsTwostep::process_broadcast(
   co_return {};
 }
 
+static td::actor::Task<td::raptorq::Decoder::DataWithEncoder> decode_fec(
+    std::unique_ptr<td::raptorq::Decoder> decoder) {
+  co_await td::actor::detach_from_actor();
+  co_return decoder->try_decode(false);
+}
+
 td::actor::Task<> BroadcastsTwostep::process_broadcast(OverlayImpl *overlay, adnl::AdnlNodeIdShort src_peer_id,
                                                        tl_object_ptr<ton_api::overlay_broadcastTwostepFec> broadcast) {
   td::uint32 date = static_cast<td::uint32>(broadcast->date_);
@@ -463,8 +470,33 @@ td::actor::Task<> BroadcastsTwostep::process_broadcast(OverlayImpl *overlay, adn
   bcast->debug.symbols_received++;
   VLOG(twostep, INFO) << "twostep RECV_CHUNK receiver " << *bcast << " seqno=" << seqno << " from=" << src_peer_id
                       << " will_rebroadcast=" << will_rebroadcast;
-  if (bcast->decoder->may_try_decode()) {
-    auto R = CO_TRY(bcast->decoder->try_decode(false));
+  while (bcast->decoder->may_try_decode()) {
+    td::Result<td::raptorq::Decoder::DataWithEncoder> result;
+    if (bcast->decoder->has_all_source_symbols()) {
+      result = bcast->decoder->try_decode(false);
+    } else {
+      if (bcast->solver_running) {
+        co_return {};
+      }
+      bcast->solver_running = true;
+      result = co_await decode_fec(bcast->decoder->take_slow_decode_snapshot()).wrap();
+      it = broadcasts_.find(broadcast_id);
+      if (it == broadcasts_.end()) {
+        co_return {};
+      }
+      bcast = it->second.get();
+      bcast->solver_running = false;
+      if (bcast->delivered || overlay->is_delivered(broadcast_id)) {
+        bcast->delivered = true;
+        bcast->decoder = {};
+        co_return {};
+      }
+      CO_TRY(overlay->check_date(date));
+      if (result.is_error() && bcast->decoder->may_try_decode()) {
+        continue;
+      }
+    }
+    auto R = CO_TRY(std::move(result));
     VLOG(twostep, INFO) << "twostep FINISH receiver " << *bcast << " decoded=true elapsed=" << bcast->debug.elapsed();
     bcast->delivered = true;
     bcast->decoder = {};
@@ -472,6 +504,7 @@ td::actor::Task<> BroadcastsTwostep::process_broadcast(OverlayImpl *overlay, adn
       co_return td::Status::Error(ErrorCode::protoviolation, "broadcast data hash mismatch");
     }
     co_await check_and_deliver(overlay, src_keyhash, check_result, std::move(R.data), std::move(broadcast->extra_));
+    co_return {};
   }
   co_return {};
 }

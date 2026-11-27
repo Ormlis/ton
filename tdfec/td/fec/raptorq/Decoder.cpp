@@ -34,6 +34,20 @@ bool Decoder::may_try_decode() const {
   return may_decode_;
 }
 
+std::unique_ptr<Decoder> Decoder::take_slow_decode_snapshot() {
+  auto copy = std::make_unique<Decoder>(p_, symbol_size_, data_size_);
+  copy->small_symbols_mask_ = small_symbols_mask_;
+  copy->small_symbols_count_ = small_symbols_count_;
+  copy->big_symbols_set_ = big_symbols_set_;
+  copy->may_decode_ = may_decode_;
+  copy->symbols_.reserve(symbols_.size());
+  for (const auto &[id, data] : symbols_) {
+    copy->symbols_.push_back({id, data.clone()});
+  }
+  may_decode_ = false;
+  return copy;
+}
+
 Status Decoder::add_symbol(fec::Symbol symbol) {
   if (symbol.data.size() != symbol_size_) {
     return Status::Error("Symbol has invalid length");
@@ -75,7 +89,7 @@ Result<Decoder::DataWithEncoder> Decoder::try_decode(bool need_encoder) {
   optional<RawEncoder> raw_encoder;
   if (!result_) {
     BufferSlice data(data_size_);
-    if (small_symbols_count_ == p_.K) {
+    if (has_all_source_symbols()) {
       for (auto &[i, s] : symbols_) {
         if (i < p_.K) {
           MutableSlice to =

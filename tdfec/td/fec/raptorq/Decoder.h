@@ -39,6 +39,10 @@ class Decoder {
   };
   Result<DataWithEncoder> try_decode(bool need_encoder);
   bool may_try_decode() const;
+  bool has_all_source_symbols() const {
+    return small_symbols_count_ == p_.K;
+  }
+  std::unique_ptr<Decoder> take_slow_decode_snapshot();
 
  private:
   Rfc::Parameters p_;
