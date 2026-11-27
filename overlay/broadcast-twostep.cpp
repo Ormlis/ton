@@ -125,6 +125,27 @@ BroadcastsTwostep::BroadcastsTwostep() = default;
 
 BroadcastsTwostep::~BroadcastsTwostep() = default;
 
+static td::actor::Task<> send_fec_parts(std::unique_ptr<td::raptorq::Encoder> encoder,
+                                        std::vector<adnl::AdnlNodeIdShort> intermediate_nodes, auto sign_part) {
+  // Keep the overlay actor free to send signed source symbols while the encoder prepares repair symbols
+  co_await td::actor::detach_from_actor();
+  const auto params = encoder->get_parameters();
+  for (size_t i = 0; i < intermediate_nodes.size(); ++i) {
+    if (i == params.symbols_count) {
+      encoder->precalc();
+    }
+    td::uint32 seqno = static_cast<std::uint32_t>(i);
+    td::BufferSlice part(params.symbol_size);
+    td::Status S = encoder->gen_symbol(seqno, part.as_slice());
+    if (S.is_error()) {
+      VLOG(twostep, WARNING) << "cannot generate symbol: " << S;
+      continue;
+    }
+    sign_part(seqno, intermediate_nodes[i], std::move(part));
+  }
+  co_return {};
+}
+
 void BroadcastsTwostep::send(OverlayImpl *overlay, PublicKeyHash send_as, td::BufferSlice data, td::BufferSlice extra,
                              td::uint32 flags) {
   size_t data_size = data.size();
@@ -153,16 +174,9 @@ void BroadcastsTwostep::send(OverlayImpl *overlay, PublicKeyHash send_as, td::Bu
       VLOG(twostep, WARNING) << "cannot create FEC encoder: " << R.move_as_error();
       return;
     }
-    auto encoder = R.move_as_ok();
-    encoder->precalc();
-    for (size_t i = 0; i < intermediate_nodes.size(); i++) {
-      td::uint32 seqno = static_cast<std::uint32_t>(i);
-      td::BufferSlice part(part_size);
-      td::Status S = encoder->gen_symbol(seqno, part.as_slice());
-      if (S.is_error()) {
-        VLOG(twostep, WARNING) << "cannot generate symbol: " << S;
-        continue;
-      }
+    auto sign_part = [overlay = actor_id(overlay), keyring_id = overlay->keyring(), send_as, flags, date, broadcast_id,
+                      data_hash, data_size,
+                      extra = extra.clone()](td::uint32 seqno, adnl::AdnlNodeIdShort dst, td::BufferSlice part) {
       td::BufferSlice to_sign = create_serialize_tl_object<ton_api::overlay_broadcastTwostepFec_toSign>(
           broadcast_id, static_cast<std::int32_t>(seqno), part.clone());
       BroadcastTwostepDataFec passdata{
@@ -170,20 +184,21 @@ void BroadcastsTwostep::send(OverlayImpl *overlay, PublicKeyHash send_as, td::Bu
           .flags = flags,
           .date = date,
           .src = adnl::AdnlNodeIdShort(send_as),
-          .dst = intermediate_nodes[i],
+          .dst = dst,
           .data_hash = data_hash,
           .data_size = static_cast<td::uint32>(data_size),
           .seqno = seqno,
           .part = std::move(part),
           .extra = extra.clone(),
       };
-      auto P = td::PromiseCreator::lambda([overlay = actor_id(overlay), data = std::move(passdata)](
-                                              td::Result<std::pair<td::BufferSlice, PublicKey>> R) mutable {
-        td::actor::send_closure(overlay, &OverlayImpl::broadcast_twostep_signed_fec, std::move(data), std::move(R));
-      });
-      td::actor::send_closure(overlay->keyring(), &keyring::Keyring::sign_add_get_public_key, send_as,
-                              std::move(to_sign), std::move(P));
-    }
+      auto P = td::PromiseCreator::lambda(
+          [overlay, data = std::move(passdata)](td::Result<std::pair<td::BufferSlice, PublicKey>> R) mutable {
+            td::actor::send_closure(overlay, &OverlayImpl::broadcast_twostep_signed_fec, std::move(data), std::move(R));
+          });
+      td::actor::send_closure(keyring_id, &keyring::Keyring::sign_add_get_public_key, send_as, std::move(to_sign),
+                              std::move(P));
+    };
+    send_fec_parts(R.move_as_ok(), std::move(intermediate_nodes), std::move(sign_part)).start_immediate().detach();
   } else {
     broadcast_id = get_tl_object_sha_bits256(create_tl_object<ton_api::overlay_broadcastTwostep_id>(
         flags, date, send_as.bits256_value(), overlay->local_id().bits256_value(), data_hash,
