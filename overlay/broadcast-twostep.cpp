@@ -472,7 +472,8 @@ td::actor::Task<> BroadcastsTwostep::process_broadcast(OverlayImpl *overlay, adn
                       << " will_rebroadcast=" << will_rebroadcast;
   while (bcast->decoder->may_try_decode()) {
     td::Result<td::raptorq::Decoder::DataWithEncoder> result;
-    if (bcast->decoder->has_all_source_symbols()) {
+    const bool fast_path = bcast->decoder->has_all_source_symbols();
+    if (fast_path) {
       result = bcast->decoder->try_decode(false);
     } else {
       if (bcast->solver_running) {
@@ -497,7 +498,8 @@ td::actor::Task<> BroadcastsTwostep::process_broadcast(OverlayImpl *overlay, adn
       }
     }
     auto R = CO_TRY(std::move(result));
-    VLOG(twostep, INFO) << "twostep FINISH receiver " << *bcast << " decoded=true elapsed=" << bcast->debug.elapsed();
+    VLOG(twostep, INFO) << "twostep FINISH receiver " << *bcast << " decoded=true elapsed=" << bcast->debug.elapsed()
+                        << " decode_path=" << (fast_path ? "fast" : "slow");
     bcast->delivered = true;
     bcast->decoder = {};
     if (broadcast->data_hash_ != td::sha256_bits256(R.data)) {
